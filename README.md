@@ -15,8 +15,8 @@ long-stt-ctl status   # check state
 journalctl --user -u long-stt -f
 
 # Deploy/destroy
-cd ansible && ansible-playbook deploy.yml
-cd ansible && ansible-playbook destroy.yml
+ansible-playbook ansible/deploy.yml
+ansible-playbook ansible/destroy.yml
 ```
 
 ## Output
