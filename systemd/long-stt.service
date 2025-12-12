@@ -1,0 +1,20 @@
+[Unit]
+Description=Long STT Daemon - Speech to text using OpenAI Realtime API
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/long-stt/.venv/bin/python %h/.local/lib/long-stt/daemon.py
+Restart=on-failure
+RestartSec=3
+
+# Environment for Wayland clipboard access
+Environment="XDG_RUNTIME_DIR=%t"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=long-stt
+
+[Install]
+WantedBy=default.target
