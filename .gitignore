@@ -9,8 +9,8 @@ __pycache__/
 .vscode/
 *.swp
 
-# Claude Code
-CLAUDE.md
+# Claude Code (has its own git repo)
+.claude/
 
 # Local
 *.log
