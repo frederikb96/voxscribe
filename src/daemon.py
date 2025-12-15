@@ -33,7 +33,7 @@ RESULT_SYMLINK = OUTPUT_DIR / "long-stt-result.txt"
 
 # Sound files
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
-SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/device-removed.oga")
+SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")  # Distinct from done sound
 SOUND_DONE = Path("/usr/share/sounds/freedesktop/stereo/complete.oga")
 
 # Logger setup
@@ -149,6 +149,9 @@ class LongSTTDaemon:
         if self.state != State.IDLE:
             return False, f"Cannot start: state is {self.state.value}"
 
+        # Set state immediately to prevent race conditions from rapid toggles
+        self.state = State.RECORDING
+        self.play_sound(SOUND_START)  # Play immediately, before any async work
         logger.info("Starting recording session")
         self.transcripts = {}
         self.pending_items = set()
@@ -171,6 +174,7 @@ class LongSTTDaemon:
             logger.info(f"pw-record started (PID {self.pw_record_proc.pid})")
         except Exception as e:
             logger.error(f"Failed to start pw-record: {e}")
+            self.state = State.IDLE
             return False, f"Failed to start audio capture: {e}"
 
         # Connect to OpenAI
@@ -229,12 +233,11 @@ class LongSTTDaemon:
             if self.pw_record_proc:
                 self.pw_record_proc.terminate()
                 self.pw_record_proc = None
+            self.state = State.IDLE
             return False, f"Failed to connect to OpenAI: {e}"
 
-        # Start recording tasks
-        self.state = State.RECORDING
+        # Start recording tasks (state already set to RECORDING at function start)
         self.recording_task = asyncio.create_task(self._recording_loop())
-        self.play_sound(SOUND_START)
         logger.info("Recording started")
         return True, "Recording started"
 
