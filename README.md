@@ -20,7 +20,7 @@ pipx install git+https://github.com/frederikb/voxscribe.git
 voxscribe setup
 ```
 
-**API key:** Add `OPENAI_API_KEY=sk-...` to `~/.claude/.env`
+**API key:** Set `OPENAI_API_KEY` environment variable (e.g., in `~/.bashrc`)
 
 ## Usage
 

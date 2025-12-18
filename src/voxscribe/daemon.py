@@ -36,7 +36,6 @@ except ImportError:
 SAMPLE_RATE = 24000
 CHUNK_BYTES = 4800  # 100ms of audio at 24kHz 16-bit mono
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voxscribe.sock"
-API_KEY_FILE = Path.home() / ".claude" / ".env"
 CONFIG_FILE = Path.home() / ".config" / "voxscribe" / "config.yaml"
 OUTPUT_DIR = Path("/tmp")
 RESULT_SYMLINK = OUTPUT_DIR / "voxscribe-result.txt"
@@ -182,18 +181,13 @@ class VoxscribeDaemon:
             self.dbus_interface.emit_state(state, text[-50:] if text else "")
 
     def load_api_key(self) -> bool:
-        """Load OpenAI API key from env file."""
-        try:
-            for line in API_KEY_FILE.read_text().splitlines():
-                if line.strip().startswith("OPENAI_API_KEY="):
-                    self.api_key = line.split("=", 1)[1].strip().strip("\"'")
-                    logger.info("API key loaded")
-                    return True
-            logger.error("OPENAI_API_KEY not found in env file")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to load API key: {e}")
-            return False
+        """Load OpenAI API key from environment variable."""
+        self.api_key = os.environ.get("OPENAI_API_KEY", "")
+        if self.api_key:
+            logger.info("API key loaded from environment")
+            return True
+        logger.error("OPENAI_API_KEY environment variable not set")
+        return False
 
     def play_sound(self, sound_file: Path) -> None:
         """Play sound file asynchronously (non-blocking)."""

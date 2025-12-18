@@ -41,6 +41,7 @@ ExecStart={python_path} -m voxscribe.daemon
 Restart=on-failure
 RestartSec=3
 Environment="XDG_RUNTIME_DIR=%t"
+PassEnvironment=OPENAI_API_KEY
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=voxscribe
@@ -78,7 +79,7 @@ transcription:
   model: gpt-4o-transcribe
 
   # Prompt to guide transcription behavior
-  prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way. Only transcribe German and English languages."
+  prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way."
 
   # Language hint (ISO-639-1 code, e.g., "en", "de")
   # Leave empty for auto-detection
@@ -131,9 +132,9 @@ def setup() -> int:
         return 1
     print("  Reloaded systemd daemon")
 
-    # Import Wayland environment variables
+    # Import environment variables for systemd
     subprocess.run(
-        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"],
+        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "OPENAI_API_KEY"],
         capture_output=True,
     )
     print("  Imported Wayland environment")
