@@ -59,18 +59,30 @@ def get_default_config() -> str:
 log_level: info
 
 # VAD (Voice Activity Detection) settings
-# All numeric values are optional - OpenAI uses sensible defaults if omitted
 vad:
-  type: server_vad  # or "semantic_vad"
-  # threshold: 0.5
-  # prefix_padding_ms: 300
-  # silence_duration_ms: 1500
+  # Type: "server_vad" (volume-based) or "semantic_vad" (AI-based)
+  type: server_vad
+
+  # Sensitivity threshold (0.0-1.0, higher = more sensitive)
+  threshold: 0.5
+
+  # Audio to include BEFORE speech detected (ms)
+  prefix_padding_ms: 300
+
+  # Silence duration to detect end of speech (ms)
+  # Lower = faster response, Higher = allows longer pauses
+  silence_duration_ms: 1500
 
 # Transcription settings
 transcription:
-  model: gpt-4o-transcribe  # Required. Or "whisper-1" for literal transcription
-  # prompt: ""              # Optional. Guide transcription behavior
-  # language: ""            # Optional. ISO-639-1 code, e.g., "en", "de"
+  # Model: gpt-4o-transcribe (smart but edits speech), whisper-1 (literal)
+  model: gpt-4o-transcribe
+
+  # Prompt to guide transcription behavior (optional)
+  prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way."
+
+  # Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
+  language: ""
 """
 
 
