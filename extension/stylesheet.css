@@ -1,0 +1,17 @@
+/* Voxscribe GNOME Shell Extension Styles */
+
+.voxscribe-label {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #cccccc;
+}
+
+/* Recording state - subtle red tint */
+.panel-status-menu-box:recording .system-status-icon {
+  color: #ff6b6b;
+}
+
+/* Done state - green tint */
+.panel-status-menu-box:done .system-status-icon {
+  color: #69db7c;
+}

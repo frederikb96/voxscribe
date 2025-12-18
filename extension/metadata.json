@@ -1,0 +1,8 @@
+{
+  "name": "Voxscribe Indicator",
+  "description": "Status indicator for Voxscribe speech-to-text daemon",
+  "uuid": "voxscribe@frederikb.github.com",
+  "version": 1,
+  "shell-version": ["45", "46", "47", "48"],
+  "url": "https://github.com/frederikb/voxscribe"
+}

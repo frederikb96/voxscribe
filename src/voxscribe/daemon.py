@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Long STT Daemon - Streaming speech-to-text using OpenAI Realtime API.
+Voxscribe Daemon - Streaming speech-to-text using OpenAI Realtime API.
 
 Runs as a systemd user service, listens on Unix socket for commands.
 Commands: START, STOP, STATUS, TOGGLE
+
+Emits DBus signals for GNOME extension integration.
 """
 
 import asyncio
@@ -22,22 +24,34 @@ from typing import Any, Optional
 import websockets
 import yaml
 
+try:
+    from dbus_next.aio import MessageBus
+    from dbus_next.service import ServiceInterface, method, signal as dbus_signal
+
+    DBUS_AVAILABLE = True
+except ImportError:
+    DBUS_AVAILABLE = False
+
 # Configuration
 SAMPLE_RATE = 24000
 CHUNK_BYTES = 4800  # 100ms of audio at 24kHz 16-bit mono
-SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "long-stt.sock"
+SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voxscribe.sock"
 API_KEY_FILE = Path.home() / ".claude" / ".env"
-CONFIG_FILE = Path(__file__).parent / "config.yaml"
+CONFIG_FILE = Path.home() / ".config" / "voxscribe" / "config.yaml"
 OUTPUT_DIR = Path("/tmp")
-RESULT_SYMLINK = OUTPUT_DIR / "long-stt-result.txt"
+RESULT_SYMLINK = OUTPUT_DIR / "voxscribe-result.txt"
 
 # Sound files
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
-SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")  # Distinct from done sound
+SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")
 SOUND_DONE = Path("/usr/share/sounds/freedesktop/stereo/complete.oga")
 
+# DBus configuration
+DBUS_NAME = "com.github.frederikb.Voxscribe"
+DBUS_PATH = "/com/github/frederikb/Voxscribe"
+
 # Logger setup
-logger = logging.getLogger("long-stt")
+logger = logging.getLogger("voxscribe")
 
 
 def setup_logging(level: str) -> None:
@@ -51,10 +65,12 @@ def setup_logging(level: str) -> None:
     log_level = level_map.get(level.lower(), logging.INFO)
 
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
-        datefmt="%H:%M:%S"
-    ))
+    handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
 
     logger.setLevel(log_level)
     logger.addHandler(handler)
@@ -62,32 +78,75 @@ def setup_logging(level: str) -> None:
 
 
 def load_config() -> dict[str, Any]:
-    """Load configuration from config.yaml (mandatory)."""
+    """Load configuration from config.yaml."""
     if not CONFIG_FILE.exists():
-        print(f"[CONFIG] ERROR: {CONFIG_FILE} not found!", flush=True)
-        sys.exit(1)
+        logger.warning(f"Config not found: {CONFIG_FILE}, using defaults")
+        return {
+            "log_level": "info",
+            "vad": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 1500,
+            },
+            "transcription": {
+                "model": "gpt-4o-transcribe",
+                "prompt": "",
+                "language": "",
+            },
+        }
 
     try:
         with open(CONFIG_FILE) as f:
             config = yaml.safe_load(f)
-        print(f"[CONFIG] Loaded from {CONFIG_FILE}", flush=True)
+        logger.info(f"Config loaded from {CONFIG_FILE}")
         return config
     except Exception as e:
-        print(f"[CONFIG] ERROR: Failed to load {CONFIG_FILE}: {e}", flush=True)
+        logger.error(f"Failed to load config: {e}")
         sys.exit(1)
 
 
 class State(Enum):
     """Daemon state machine."""
+
     IDLE = "idle"
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
 
 
-class LongSTTDaemon:
+# DBus interface for GNOME extension
+if DBUS_AVAILABLE:
+
+    class VoxscribeDBusInterface(ServiceInterface):
+        """DBus interface for status updates to GNOME extension."""
+
+        def __init__(self) -> None:
+            super().__init__(DBUS_NAME)
+            self._state = "idle"
+            self._text = ""
+
+        @dbus_signal()
+        def StateChanged(self) -> "ss":
+            """Signal emitted when state changes. Returns (state, text)."""
+            return [self._state, self._text]
+
+        @method()
+        def GetStatus(self) -> "ss":
+            """Get current state and last transcription text."""
+            return [self._state, self._text]
+
+        def emit_state(self, state: str, text: str = "") -> None:
+            """Emit state change signal."""
+            self._state = state
+            self._text = text
+            self.StateChanged()
+
+
+class VoxscribeDaemon:
     """Main daemon class managing recording and transcription."""
 
     def __init__(self, config: dict[str, Any]) -> None:
+        """Initialize daemon with configuration."""
         self.state = State.IDLE
         self.api_key: str = ""
         self.config = config
@@ -95,9 +154,32 @@ class LongSTTDaemon:
         self.pending_items: set[str] = set()
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.recording_task: Optional[asyncio.Task] = None
+        self.recording_task: Optional[asyncio.Task[None]] = None
         self.shutdown_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
+        self.dbus_interface: Optional[Any] = None
+        self.dbus_bus: Optional[Any] = None
+
+    async def setup_dbus(self) -> None:
+        """Set up DBus service for GNOME extension communication."""
+        if not DBUS_AVAILABLE:
+            logger.info("DBus not available (dbus-next not installed)")
+            return
+
+        try:
+            self.dbus_bus = await MessageBus().connect()
+            self.dbus_interface = VoxscribeDBusInterface()
+            self.dbus_bus.export(DBUS_PATH, self.dbus_interface)
+            await self.dbus_bus.request_name(DBUS_NAME)
+            logger.info(f"DBus service registered: {DBUS_NAME}")
+        except Exception as e:
+            logger.warning(f"DBus setup failed (extension won't work): {e}")
+            self.dbus_interface = None
+
+    def emit_state(self, state: str, text: str = "") -> None:
+        """Emit state change via DBus."""
+        if self.dbus_interface:
+            self.dbus_interface.emit_state(state, text[-50:] if text else "")
 
     def load_api_key(self) -> bool:
         """Load OpenAI API key from env file."""
@@ -120,7 +202,7 @@ class LongSTTDaemon:
                 subprocess.Popen(
                     ["pw-play", str(sound_file)],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL,
                 )
             except Exception as e:
                 logger.debug(f"Sound play failed: {e}")
@@ -133,7 +215,7 @@ class LongSTTDaemon:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True
+                start_new_session=True,
             )
             logger.info(f"Copied {len(text)} chars to clipboard")
             return True
@@ -151,14 +233,15 @@ class LongSTTDaemon:
 
         # Set state immediately to prevent race conditions from rapid toggles
         self.state = State.RECORDING
-        self.play_sound(SOUND_START)  # Play immediately, before any async work
+        self.play_sound(SOUND_START)
+        self.emit_state("recording", "")
         logger.info("Starting recording session")
         self.transcripts = {}
         self.pending_items = set()
 
         # Create timestamped output file and update symlink
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.current_output_file = OUTPUT_DIR / f"long-stt-{timestamp}.txt"
+        self.current_output_file = OUTPUT_DIR / f"voxscribe-{timestamp}.txt"
         self.current_output_file.touch()
         RESULT_SYMLINK.unlink(missing_ok=True)
         RESULT_SYMLINK.symlink_to(self.current_output_file)
@@ -167,26 +250,31 @@ class LongSTTDaemon:
         # Start pw-record
         try:
             self.pw_record_proc = await asyncio.create_subprocess_exec(
-                "pw-record", "--rate", str(SAMPLE_RATE), "--format", "s16", "--channels", "1", "-",
+                "pw-record",
+                "--rate",
+                str(SAMPLE_RATE),
+                "--format",
+                "s16",
+                "--channels",
+                "1",
+                "-",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
+                stderr=asyncio.subprocess.DEVNULL,
             )
             logger.info(f"pw-record started (PID {self.pw_record_proc.pid})")
         except Exception as e:
             logger.error(f"Failed to start pw-record: {e}")
             self.state = State.IDLE
+            self.emit_state("idle", "")
             return False, f"Failed to start audio capture: {e}"
 
         # Connect to OpenAI
         try:
             url = "wss://api.openai.com/v1/realtime?intent=transcription"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "OpenAI-Beta": "realtime=v1"
-            }
+            headers = {"Authorization": f"Bearer {self.api_key}", "OpenAI-Beta": "realtime=v1"}
             self.websocket = await asyncio.wait_for(
                 websockets.connect(url, additional_headers=headers, max_size=None),
-                timeout=10
+                timeout=10,
             )
             logger.info("WebSocket connected")
 
@@ -213,17 +301,16 @@ class LongSTTDaemon:
                     "threshold": vad_config["threshold"],
                     "prefix_padding_ms": vad_config["prefix_padding_ms"],
                     "silence_duration_ms": vad_config["silence_duration_ms"],
-                }
+                },
             }
 
             logger.info(f"VAD: {vad_config['type']}, silence={vad_config['silence_duration_ms']}ms")
             if transcription_config.get("prompt"):
                 logger.debug(f"Prompt: {transcription_config['prompt'][:80]}...")
 
-            await self.websocket.send(json.dumps({
-                "type": "transcription_session.update",
-                "session": session_config
-            }))
+            await self.websocket.send(
+                json.dumps({"type": "transcription_session.update", "session": session_config})
+            )
             msg = await asyncio.wait_for(self.websocket.recv(), timeout=5)
             ev = json.loads(msg)
             logger.debug(f"Session configured: {ev.get('type')}")
@@ -234,9 +321,10 @@ class LongSTTDaemon:
                 self.pw_record_proc.terminate()
                 self.pw_record_proc = None
             self.state = State.IDLE
+            self.emit_state("idle", "")
             return False, f"Failed to connect to OpenAI: {e}"
 
-        # Start recording tasks (state already set to RECORDING at function start)
+        # Start recording tasks
         self.recording_task = asyncio.create_task(self._recording_loop())
         logger.info("Recording started")
         return True, "Recording started"
@@ -251,6 +339,7 @@ class LongSTTDaemon:
         logger.info("Stopping recording")
         self.play_sound(SOUND_STOP)
         self.state = State.TRANSCRIBING
+        self.emit_state("transcribing", self._get_current_text())
 
         # Cancel recording task first to free websocket recv
         if self.recording_task and not self.recording_task.done():
@@ -319,7 +408,7 @@ class LongSTTDaemon:
         logger.info(f"Final transcription: {len(result)} chars")
 
         if result:
-            # Final write to timestamped file (already has timestamp from start)
+            # Final write to timestamped file
             if self.current_output_file:
                 self.current_output_file.write_text(result)
                 logger.info(f"Saved: {self.current_output_file.name}")
@@ -328,18 +417,27 @@ class LongSTTDaemon:
             self.copy_to_clipboard(clipboard_text)
 
         self.play_sound(SOUND_DONE)
+        self.emit_state("done", result[-50:] if result else "")
         self.state = State.IDLE
+
+        # Schedule idle state emission after 5 seconds
+        asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
+
         return True, f"Transcription complete: {len(result)} chars"
+
+    def _get_current_text(self) -> str:
+        """Get current transcription text."""
+        return " ".join(self.transcripts[k] for k in sorted(self.transcripts)).strip()
 
     def _write_result_file(self) -> None:
         """Write current transcripts to output file (live updates)."""
         if not self.current_output_file:
             return
-        result = " ".join(self.transcripts[k] for k in sorted(self.transcripts)).strip()
+        result = self._get_current_text()
         if result:
             self.current_output_file.write_text(result)
 
-    def _handle_event(self, ev: dict) -> None:
+    def _handle_event(self, ev: dict[str, Any]) -> None:
         """Handle OpenAI event."""
         t = ev.get("type", "")
         item_id = ev.get("item_id", "")
@@ -354,7 +452,8 @@ class LongSTTDaemon:
             if item_id and delta:
                 self.transcripts[item_id] = self.transcripts.get(item_id, "") + delta
                 logger.debug(f"Delta [{item_id[:8]}]: +{len(delta)} chars")
-                self._write_result_file()  # Live update
+                self._write_result_file()
+                self.emit_state("recording", self._get_current_text())
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = ev.get("transcript", "")
@@ -363,32 +462,39 @@ class LongSTTDaemon:
                     self.transcripts[item_id] = transcript
                 self.pending_items.discard(item_id)
                 logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
-                self._write_result_file()  # Final update for this item
+                self._write_result_file()
+                self.emit_state("recording", self._get_current_text())
 
         elif t == "input_audio_buffer.committed":
-            item_id = ev.get("item_id", "")
-            if item_id:
-                self.pending_items.add(item_id)
-                logger.info(f"Commit created item: {item_id[:8]}")
+            committed_item_id = ev.get("item_id", "")
+            if committed_item_id:
+                self.pending_items.add(committed_item_id)
+                logger.info(f"Commit created item: {committed_item_id[:8]}")
 
         elif t == "error":
             logger.error(f"API error: {ev.get('error', {})}")
 
     async def _recording_loop(self) -> None:
         """Main loop for sending audio and receiving events."""
+
         async def send_audio() -> None:
             while self.state == State.RECORDING and self.pw_record_proc and self.websocket:
                 try:
+                    assert self.pw_record_proc.stdout is not None
                     chunk = await asyncio.wait_for(
                         self.pw_record_proc.stdout.read(CHUNK_BYTES),
-                        timeout=0.2
+                        timeout=0.2,
                     )
                     if not chunk:
                         break
-                    await self.websocket.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(chunk).decode()
-                    }))
+                    await self.websocket.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": base64.b64encode(chunk).decode(),
+                            }
+                        )
+                    )
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
@@ -434,7 +540,9 @@ class LongSTTDaemon:
         else:
             return f"ERROR: Unknown command '{cmd}'"
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         """Handle a client connection."""
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -471,6 +579,12 @@ class LongSTTDaemon:
             except Exception:
                 pass
 
+        if self.dbus_bus:
+            try:
+                self.dbus_bus.disconnect()
+            except Exception:
+                pass
+
         try:
             SOCKET_PATH.unlink(missing_ok=True)
         except Exception:
@@ -485,6 +599,9 @@ class LongSTTDaemon:
 
         SOCKET_PATH.unlink(missing_ok=True)
 
+        # Set up DBus for GNOME extension
+        await self.setup_dbus()
+
         loop = asyncio.get_event_loop()
 
         def signal_handler() -> None:
@@ -494,10 +611,7 @@ class LongSTTDaemon:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        server = await asyncio.start_unix_server(
-            self.handle_client,
-            path=str(SOCKET_PATH)
-        )
+        server = await asyncio.start_unix_server(self.handle_client, path=str(SOCKET_PATH))
         SOCKET_PATH.chmod(0o600)
         logger.info(f"Listening on {SOCKET_PATH}")
 
@@ -510,15 +624,15 @@ class LongSTTDaemon:
 
 def main() -> None:
     """Entry point."""
-    print("[DAEMON] Long STT daemon starting...", flush=True)
+    print("[DAEMON] Voxscribe daemon starting...", flush=True)
 
     config = load_config()
     setup_logging(config.get("log_level", "info"))
 
-    daemon = LongSTTDaemon(config)
+    daemon = VoxscribeDaemon(config)
     asyncio.run(daemon.run())
 
-    print("[DAEMON] Long STT daemon stopped", flush=True)
+    print("[DAEMON] Voxscribe daemon stopped", flush=True)
 
 
 if __name__ == "__main__":
