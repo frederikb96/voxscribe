@@ -147,12 +147,14 @@ const VoxscribeIndicator = GObject.registerClass(
 
         case "done":
           this._label.set_text("Copied!");
-          // Auto-hide after 5 seconds
+          // Auto-hide after 5 seconds (only if still in done state)
           this._hideTimeoutId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT,
             5,
             () => {
-              this.hide();
+              if (this._state === "done") {
+                this.hide();
+              }
               this._hideTimeoutId = null;
               return GLib.SOURCE_REMOVE;
             }
