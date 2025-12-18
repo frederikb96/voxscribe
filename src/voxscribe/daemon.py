@@ -77,23 +77,11 @@ def setup_logging(level: str) -> None:
 
 
 def load_config() -> dict[str, Any]:
-    """Load configuration from config.yaml."""
+    """Load configuration from config.yaml. Fails if not found."""
     if not CONFIG_FILE.exists():
-        logger.warning(f"Config not found: {CONFIG_FILE}, using defaults")
-        return {
-            "log_level": "info",
-            "vad": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 1500,
-            },
-            "transcription": {
-                "model": "gpt-4o-transcribe",
-                "prompt": "",
-                "language": "",
-            },
-        }
+        print(f"[CONFIG] ERROR: Config not found: {CONFIG_FILE}", flush=True)
+        print("[CONFIG] Run 'voxscribe setup' first to create config.", flush=True)
+        sys.exit(1)
 
     try:
         with open(CONFIG_FILE) as f:
@@ -277,28 +265,35 @@ class VoxscribeDaemon:
             ev = json.loads(msg)
             logger.debug(f"Received: {ev.get('type')}")
 
-            # Configure session
-            vad_config = self.config["vad"]
-            transcription_config = self.config["transcription"]
+            # Configure session - only include values that are set in config
+            vad_config = self.config.get("vad", {})
+            transcription_config = self.config.get("transcription", {})
 
+            # Transcription settings - model is required
+            if "model" not in transcription_config:
+                raise ValueError("transcription.model is required in config")
             transcription_settings: dict[str, Any] = {"model": transcription_config["model"]}
             if transcription_config.get("prompt"):
                 transcription_settings["prompt"] = transcription_config["prompt"]
             if transcription_config.get("language"):
                 transcription_settings["language"] = transcription_config["language"]
 
+            # VAD settings - only include values that are set, let OpenAI use defaults
+            turn_detection: dict[str, Any] = {"type": vad_config.get("type", "server_vad")}
+            if "threshold" in vad_config:
+                turn_detection["threshold"] = vad_config["threshold"]
+            if "prefix_padding_ms" in vad_config:
+                turn_detection["prefix_padding_ms"] = vad_config["prefix_padding_ms"]
+            if "silence_duration_ms" in vad_config:
+                turn_detection["silence_duration_ms"] = vad_config["silence_duration_ms"]
+
             session_config: dict[str, Any] = {
                 "input_audio_format": "pcm16",
                 "input_audio_transcription": transcription_settings,
-                "turn_detection": {
-                    "type": vad_config["type"],
-                    "threshold": vad_config["threshold"],
-                    "prefix_padding_ms": vad_config["prefix_padding_ms"],
-                    "silence_duration_ms": vad_config["silence_duration_ms"],
-                },
+                "turn_detection": turn_detection,
             }
 
-            logger.info(f"VAD: {vad_config['type']}, silence={vad_config['silence_duration_ms']}ms")
+            logger.info(f"VAD: {turn_detection.get('type')}, config keys: {list(turn_detection.keys())}")
             if transcription_config.get("prompt"):
                 logger.debug(f"Prompt: {transcription_config['prompt'][:80]}...")
 
