@@ -32,6 +32,7 @@ const ICONS = {
   transcribing: "emblem-synchronizing-symbolic",
   done: "emblem-ok-symbolic",
   partial: "dialog-warning-symbolic",
+  error: "dialog-error-symbolic",
 };
 
 const VoxscribeIndicator = GObject.registerClass(
@@ -170,6 +171,22 @@ const VoxscribeIndicator = GObject.registerClass(
             5,
             () => {
               if (this._state === "partial") {
+                this.hide();
+              }
+              this._hideTimeoutId = null;
+              return GLib.SOURCE_REMOVE;
+            }
+          );
+          break;
+
+        case "error":
+          this._label.set_text("Error!");
+          // Auto-hide after 5 seconds (only if still in error state)
+          this._hideTimeoutId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            5,
+            () => {
+              if (this._state === "error") {
                 this.hide();
               }
               this._hideTimeoutId = null;

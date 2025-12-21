@@ -249,8 +249,10 @@ class VoxscribeDaemon:
             logger.info(f"pw-record started (PID {self.pw_record_proc.pid})")
         except Exception as e:
             logger.error(f"Failed to start pw-record: {e}")
+            self.play_sound(SOUND_ERROR)
+            self.emit_state("error", "")
             self.state = State.IDLE
-            self.emit_state("idle", "")
+            asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
             return False, f"Failed to start audio capture: {e}"
 
         # Connect to OpenAI
@@ -312,8 +314,10 @@ class VoxscribeDaemon:
             if self.pw_record_proc:
                 self.pw_record_proc.terminate()
                 self.pw_record_proc = None
+            self.play_sound(SOUND_ERROR)
+            self.emit_state("error", "")
             self.state = State.IDLE
-            self.emit_state("idle", "")
+            asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
             return False, f"Failed to connect to OpenAI: {e}"
 
         # Start recording tasks
