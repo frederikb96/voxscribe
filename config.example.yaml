@@ -3,6 +3,10 @@
 # Logging level: debug, info, warning, error
 log_level: info
 
+# Max seconds to wait for final transcription after stopping recording
+# Long recordings may need more time to process
+transcription_timeout: 120
+
 # VAD (Voice Activity Detection) settings
 vad:
   # Type: "server_vad" (volume-based) or "semantic_vad" (AI-based)
@@ -16,7 +20,7 @@ vad:
 
   # Silence duration to detect end of speech (ms)
   # Lower = faster response, Higher = allows longer pauses
-  silence_duration_ms: 1500
+  silence_duration_ms: 1000
 
 # Transcription settings
 transcription:

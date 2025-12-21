@@ -44,6 +44,7 @@ RESULT_SYMLINK = OUTPUT_DIR / "voxscribe-result.txt"
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
 SOUND_STOP = Path("/usr/share/sounds/freedesktop/stereo/message.oga")
 SOUND_DONE = Path("/usr/share/sounds/freedesktop/stereo/complete.oga")
+SOUND_ERROR = Path("/usr/share/sounds/freedesktop/stereo/dialog-warning.oga")
 
 # DBus configuration
 DBUS_NAME = "com.github.frederikb.Voxscribe"
@@ -139,6 +140,7 @@ class VoxscribeDaemon:
         self.config = config
         self.transcripts: dict[str, str] = {}
         self.pending_items: set[str] = set()
+        self.failed_items: set[str] = set()
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.recording_task: Optional[asyncio.Task[None]] = None
@@ -220,6 +222,7 @@ class VoxscribeDaemon:
         logger.info("Starting recording session")
         self.transcripts = {}
         self.pending_items = set()
+        self.failed_items = set()
 
         # Create timestamped output file and update symlink
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -359,7 +362,7 @@ class VoxscribeDaemon:
 
         # Wait for transcriptions (event-driven)
         wait_start = asyncio.get_event_loop().time()
-        safety_timeout = 30
+        safety_timeout = self.config.get("transcription_timeout", 120)
 
         while self.pending_items and (asyncio.get_event_loop().time() - wait_start) < safety_timeout:
             if not self.websocket:
@@ -392,12 +395,11 @@ class VoxscribeDaemon:
             self.websocket = None
             logger.info("WebSocket closed")
 
-        # Process result
+        # Process result - always save whatever we have
         result = " ".join(self.transcripts[k] for k in sorted(self.transcripts)).strip()
         logger.info(f"Final transcription: {len(result)} chars")
 
         if result:
-            # Final write to timestamped file
             if self.current_output_file:
                 self.current_output_file.write_text(result)
                 logger.info(f"Saved: {self.current_output_file.name}")
@@ -405,14 +407,24 @@ class VoxscribeDaemon:
             clipboard_text = f"stt-rec: {result}"
             self.copy_to_clipboard(clipboard_text)
 
-        self.play_sound(SOUND_DONE)
-        self.emit_state("done", result[-50:] if result else "")
+        # Determine outcome and play appropriate sound
+        has_failures = bool(self.failed_items or self.pending_items)
+        if has_failures:
+            lost_count = len(self.failed_items) + len(self.pending_items)
+            logger.warning(f"Partial transcription: {lost_count} items failed/pending")
+            self.play_sound(SOUND_ERROR)
+            self.emit_state("partial", result[-50:] if result else "")
+        else:
+            self.play_sound(SOUND_DONE)
+            self.emit_state("done", result[-50:] if result else "")
+
         self.state = State.IDLE
 
         # Schedule idle state emission after 5 seconds
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
 
-        return True, f"Transcription complete: {len(result)} chars"
+        status = "partial" if has_failures else "complete"
+        return True, f"Transcription {status}: {len(result)} chars"
 
     def _get_current_text(self) -> str:
         """Get current transcription text."""
@@ -459,6 +471,16 @@ class VoxscribeDaemon:
             if committed_item_id:
                 self.pending_items.add(committed_item_id)
                 logger.info(f"Commit created item: {committed_item_id[:8]}")
+
+        elif t == "conversation.item.input_audio_transcription.failed":
+            error = ev.get("error", {})
+            if item_id:
+                self.failed_items.add(item_id)
+                self.pending_items.discard(item_id)
+                logger.error(
+                    f"Transcription failed [{item_id[:8]}]: "
+                    f"{error.get('code', 'unknown')} - {error.get('message', 'No message')}"
+                )
 
         elif t == "error":
             logger.error(f"API error: {ev.get('error', {})}")

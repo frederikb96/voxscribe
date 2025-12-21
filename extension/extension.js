@@ -31,6 +31,7 @@ const ICONS = {
   recording: "media-record-symbolic",
   transcribing: "emblem-synchronizing-symbolic",
   done: "emblem-ok-symbolic",
+  partial: "dialog-warning-symbolic",
 };
 
 const VoxscribeIndicator = GObject.registerClass(
@@ -153,6 +154,22 @@ const VoxscribeIndicator = GObject.registerClass(
             5,
             () => {
               if (this._state === "done") {
+                this.hide();
+              }
+              this._hideTimeoutId = null;
+              return GLib.SOURCE_REMOVE;
+            }
+          );
+          break;
+
+        case "partial":
+          this._label.set_text("Partial!");
+          // Auto-hide after 5 seconds (only if still in partial state)
+          this._hideTimeoutId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            5,
+            () => {
+              if (this._state === "partial") {
                 this.hide();
               }
               this._hideTimeoutId = null;
