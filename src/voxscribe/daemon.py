@@ -179,6 +179,26 @@ class VoxscribeDaemon:
         logger.error("OPENAI_API_KEY environment variable not set")
         return False
 
+    async def _terminate_pw_record(self) -> None:
+        """Properly terminate pw-record process with wait and kill fallback."""
+        if not self.pw_record_proc:
+            return
+        try:
+            self.pw_record_proc.terminate()
+            await asyncio.wait_for(self.pw_record_proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            logger.warning("pw-record didn't respond to SIGTERM, sending SIGKILL")
+            self.pw_record_proc.kill()
+            try:
+                await asyncio.wait_for(self.pw_record_proc.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                logger.error("pw-record didn't respond to SIGKILL!")
+        except Exception as e:
+            logger.error(f"Error terminating pw-record: {e}")
+        finally:
+            self.pw_record_proc = None
+        logger.info("pw-record stopped")
+
     def play_sound(self, sound_file: Path) -> None:
         """Play sound file asynchronously (non-blocking)."""
         if sound_file.exists():
@@ -311,9 +331,7 @@ class VoxscribeDaemon:
 
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI: {e}")
-            if self.pw_record_proc:
-                self.pw_record_proc.terminate()
-                self.pw_record_proc = None
+            await self._terminate_pw_record()
             self.play_sound(SOUND_ERROR)
             self.emit_state("error", "")
             self.state = State.IDLE
@@ -347,14 +365,7 @@ class VoxscribeDaemon:
             logger.debug("Recording task cancelled")
 
         # Terminate pw-record
-        if self.pw_record_proc:
-            self.pw_record_proc.terminate()
-            try:
-                await asyncio.wait_for(self.pw_record_proc.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                self.pw_record_proc.kill()
-            logger.info("pw-record stopped")
-            self.pw_record_proc = None
+        await self._terminate_pw_record()
 
         # Send commit to force transcription
         if self.websocket:
