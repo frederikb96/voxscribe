@@ -500,10 +500,43 @@ class VoxscribeDaemon:
         elif t == "error":
             logger.error(f"API error: {ev.get('error', {})}")
 
+    async def _handle_recording_failure(self) -> None:
+        """Handle WebSocket failure during recording - save partial data and notify user."""
+        logger.warning("Handling recording failure - saving partial data")
+
+        # Stop pw-record
+        await self._terminate_pw_record()
+
+        # Close websocket if still open
+        if self.websocket:
+            try:
+                await asyncio.wait_for(self.websocket.close(), timeout=1)
+            except Exception:
+                pass
+            self.websocket = None
+
+        # Save whatever transcripts we have
+        result = self._get_current_text()
+        if result:
+            if self.current_output_file:
+                self.current_output_file.write_text(result)
+                logger.info(f"Saved partial: {self.current_output_file.name}")
+            clipboard_text = f"stt-rec: {result}"
+            self.copy_to_clipboard(clipboard_text)
+            logger.info(f"Saved {len(result)} chars before connection loss")
+
+        # Notify user of failure
+        self.play_sound(SOUND_ERROR)
+        self.emit_state("partial", result[-50:] if result else "Connection lost")
+        self.state = State.IDLE
+        asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
+
     async def _recording_loop(self) -> None:
         """Main loop for sending audio and receiving events."""
+        websocket_error = False
 
         async def send_audio() -> None:
+            nonlocal websocket_error
             while self.state == State.RECORDING and self.pw_record_proc and self.websocket:
                 try:
                     assert self.pw_record_proc.stdout is not None
@@ -527,9 +560,11 @@ class VoxscribeDaemon:
                     break
                 except Exception as e:
                     logger.error(f"Send audio error: {e}")
+                    websocket_error = True
                     break
 
         async def recv_events() -> None:
+            nonlocal websocket_error
             while self.state == State.RECORDING and self.websocket:
                 try:
                     msg = await asyncio.wait_for(self.websocket.recv(), timeout=0.2)
@@ -540,9 +575,14 @@ class VoxscribeDaemon:
                     break
                 except Exception as e:
                     logger.error(f"Recv event error: {e}")
+                    websocket_error = True
                     break
 
         await asyncio.gather(send_audio(), recv_events(), return_exceptions=True)
+
+        # If WebSocket died during recording, handle failure immediately
+        if websocket_error and self.state == State.RECORDING:
+            await self._handle_recording_failure()
 
     async def handle_command(self, cmd: str) -> str:
         """Handle incoming command from client."""
