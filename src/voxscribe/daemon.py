@@ -141,6 +141,7 @@ class VoxscribeDaemon:
         self.transcripts: dict[str, str] = {}
         self.pending_items: set[str] = set()
         self.failed_items: set[str] = set()
+        self.item_creation_times: dict[str, float] = {}
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.recording_task: Optional[asyncio.Task[None]] = None
@@ -243,6 +244,7 @@ class VoxscribeDaemon:
         self.transcripts = {}
         self.pending_items = set()
         self.failed_items = set()
+        self.item_creation_times = {}
 
         # Create timestamped output file and update symlink
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -477,6 +479,7 @@ class VoxscribeDaemon:
                 if transcript:
                     self.transcripts[item_id] = transcript
                 self.pending_items.discard(item_id)
+                self.item_creation_times.pop(item_id, None)
                 logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
                 self._write_result_file()
                 self.emit_state("recording", self._get_current_text())
@@ -485,6 +488,7 @@ class VoxscribeDaemon:
             committed_item_id = ev.get("item_id", "")
             if committed_item_id:
                 self.pending_items.add(committed_item_id)
+                self.item_creation_times[committed_item_id] = asyncio.get_event_loop().time()
                 logger.info(f"Commit created item: {committed_item_id[:8]}")
 
         elif t == "conversation.item.input_audio_transcription.failed":
@@ -492,6 +496,7 @@ class VoxscribeDaemon:
             if item_id:
                 self.failed_items.add(item_id)
                 self.pending_items.discard(item_id)
+                self.item_creation_times.pop(item_id, None)
                 logger.error(
                     f"Transcription failed [{item_id[:8]}]: "
                     f"{error.get('code', 'unknown')} - {error.get('message', 'No message')}"
@@ -530,6 +535,12 @@ class VoxscribeDaemon:
         self.emit_state("partial", result[-50:] if result else "Connection lost")
         self.state = State.IDLE
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
+
+    async def _alert_transcription_stall(self, item_id: str, age: float) -> None:
+        """Alert user that transcription is stalled during recording."""
+        logger.warning(f"Transcription stalled for {item_id[:8]} ({age:.1f}s with no completion)")
+        self.play_sound(SOUND_ERROR)
+        self.emit_state("partial", f"Transcription delayed ({age:.0f}s)")
 
     async def _recording_loop(self) -> None:
         """Main loop for sending audio and receiving events."""
@@ -578,7 +589,28 @@ class VoxscribeDaemon:
                     websocket_error = True
                     break
 
-        await asyncio.gather(send_audio(), recv_events(), return_exceptions=True)
+        async def monitor_transcriptions() -> None:
+            """Monitor pending transcriptions and alert if stalled."""
+            alerted_items: set[str] = set()
+
+            while self.state == State.RECORDING:
+                try:
+                    await asyncio.sleep(5)
+
+                    now = asyncio.get_event_loop().time()
+                    for item_id, created_at in list(self.item_creation_times.items()):
+                        age = now - created_at
+
+                        if age > 20 and item_id not in alerted_items:
+                            await self._alert_transcription_stall(item_id, age)
+                            alerted_items.add(item_id)
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Monitor error: {e}")
+
+        await asyncio.gather(send_audio(), recv_events(), monitor_transcriptions(), return_exceptions=True)
 
         # If WebSocket died during recording, handle failure immediately
         if websocket_error and self.state == State.RECORDING:
