@@ -463,13 +463,11 @@ class VoxscribeDaemon:
         if t == "input_audio_buffer.speech_started":
             if item_id:
                 self.pending_items.add(item_id)
-                logger.debug(f"Speech started: {item_id}")
 
         elif t == "conversation.item.input_audio_transcription.delta":
             delta = ev.get("delta", "")
             if item_id and delta:
                 self.transcripts[item_id] = self.transcripts.get(item_id, "") + delta
-                logger.debug(f"Delta [{item_id[:8]}]: +{len(delta)} chars")
                 self._write_result_file()
                 self.emit_state("recording", self._get_current_text())
 
@@ -479,8 +477,13 @@ class VoxscribeDaemon:
                 if transcript:
                     self.transcripts[item_id] = transcript
                 self.pending_items.discard(item_id)
-                self.item_creation_times.pop(item_id, None)
-                logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
+                # Calculate and log latency
+                created_at = self.item_creation_times.pop(item_id, None)
+                if created_at:
+                    latency = asyncio.get_event_loop().time() - created_at
+                    logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars ({latency:.1f}s latency)")
+                else:
+                    logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
                 self._write_result_file()
                 self.emit_state("recording", self._get_current_text())
 
@@ -543,77 +546,158 @@ class VoxscribeDaemon:
         self.emit_state("partial", f"Transcription delayed ({age:.0f}s)")
 
     async def _recording_loop(self) -> None:
-        """Main loop for sending audio and receiving events."""
+        """Main loop for sending audio and receiving events.
+
+        Uses asyncio.wait(FIRST_COMPLETED) so we react immediately when
+        either WebSocket task exits, rather than waiting for all tasks.
+        """
+        logger.info("Recording loop started")
+        loop_start = asyncio.get_event_loop().time()
         websocket_error = False
+        exit_reason = "unknown"
 
         async def send_audio() -> None:
-            nonlocal websocket_error
-            while self.state == State.RECORDING and self.pw_record_proc and self.websocket:
-                try:
-                    assert self.pw_record_proc.stdout is not None
-                    chunk = await asyncio.wait_for(
-                        self.pw_record_proc.stdout.read(CHUNK_BYTES),
-                        timeout=0.2,
-                    )
-                    if not chunk:
-                        break
-                    await self.websocket.send(
-                        json.dumps(
-                            {
-                                "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(chunk).decode(),
-                            }
+            """Send audio chunks to WebSocket."""
+            nonlocal websocket_error, exit_reason
+            logger.debug("send_audio task started")
+            try:
+                while self.state == State.RECORDING and self.pw_record_proc and self.websocket:
+                    try:
+                        assert self.pw_record_proc.stdout is not None
+                        chunk = await asyncio.wait_for(
+                            self.pw_record_proc.stdout.read(CHUNK_BYTES),
+                            timeout=0.2,
                         )
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Send audio error: {e}")
-                    websocket_error = True
-                    break
+                        if not chunk:
+                            break
+                        await self.websocket.send(
+                            json.dumps(
+                                {
+                                    "type": "input_audio_buffer.append",
+                                    "audio": base64.b64encode(chunk).decode(),
+                                }
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Send audio error: {e}")
+                        websocket_error = True
+                        exit_reason = "send_audio_error"
+                        break
+            finally:
+                logger.debug("send_audio task exiting")
 
         async def recv_events() -> None:
-            nonlocal websocket_error
-            while self.state == State.RECORDING and self.websocket:
-                try:
-                    msg = await asyncio.wait_for(self.websocket.recv(), timeout=0.2)
-                    self._handle_event(json.loads(msg))
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Recv event error: {e}")
-                    websocket_error = True
-                    break
+            """Receive and handle WebSocket events."""
+            nonlocal websocket_error, exit_reason
+            logger.debug("recv_events task started")
+            try:
+                while self.state == State.RECORDING and self.websocket:
+                    try:
+                        msg = await asyncio.wait_for(self.websocket.recv(), timeout=0.2)
+                        self._handle_event(json.loads(msg))
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Recv event error: {e}")
+                        websocket_error = True
+                        exit_reason = "recv_events_error"
+                        break
+            finally:
+                logger.debug("recv_events task exiting")
 
         async def monitor_transcriptions() -> None:
             """Monitor pending transcriptions and alert if stalled."""
+            logger.debug("monitor task started")
             alerted_items: set[str] = set()
-
-            while self.state == State.RECORDING:
-                try:
+            heartbeat_interval = 30
+            last_heartbeat = asyncio.get_event_loop().time()
+            try:
+                while self.state == State.RECORDING:
                     await asyncio.sleep(5)
 
                     now = asyncio.get_event_loop().time()
+
+                    # Periodic heartbeat
+                    if now - last_heartbeat >= heartbeat_interval:
+                        duration = now - loop_start
+                        oldest_age = 0.0
+                        if self.item_creation_times:
+                            oldest_age = now - min(self.item_creation_times.values())
+                        logger.debug(
+                            f"Recording heartbeat: {duration:.0f}s elapsed, "
+                            f"{len(self.pending_items)} pending, oldest {oldest_age:.0f}s ago"
+                        )
+                        last_heartbeat = now
+
+                    # Check for stalled transcriptions
+                    stall_threshold = self.config.get("stall_alert_threshold", 10)
                     for item_id, created_at in list(self.item_creation_times.items()):
                         age = now - created_at
 
-                        if age > 20 and item_id not in alerted_items:
+                        if age > stall_threshold and item_id not in alerted_items:
                             await self._alert_transcription_stall(item_id, age)
                             alerted_items.add(item_id)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.debug("monitor task exiting")
 
+        # Create tasks explicitly so we can manage them
+        send_task = asyncio.create_task(send_audio())
+        recv_task = asyncio.create_task(recv_events())
+        monitor_task = asyncio.create_task(monitor_transcriptions())
+
+        try:
+            # Wait for EITHER send or recv to complete (whichever exits first)
+            # This returns immediately when any websocket task exits
+            done, pending = await asyncio.wait(
+                {send_task, recv_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            logger.debug(f"WebSocket task exited: done={len(done)}, pending={len(pending)}")
+
+            # Determine exit reason if not already set by error
+            if exit_reason == "unknown":
+                if self.state != State.RECORDING:
+                    exit_reason = "user_stopped"
+                else:
+                    exit_reason = "task_exited"
+
+            # Cancel the other websocket task if still running
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
                 except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Monitor error: {e}")
+                    pass
 
-        await asyncio.gather(send_audio(), recv_events(), monitor_transcriptions(), return_exceptions=True)
+        except asyncio.CancelledError:
+            exit_reason = "cancelled"
+            raise
 
-        # If WebSocket died during recording, handle failure immediately
+        finally:
+            # Cancel ALL tasks when exiting (handles external cancellation too)
+            for task in [send_task, recv_task, monitor_task]:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            # Log exit summary
+            duration = asyncio.get_event_loop().time() - loop_start
+            logger.info(f"Recording loop ended: {exit_reason} ({duration:.1f}s)")
+
+        # If WebSocket error occurred during recording, handle failure
         if websocket_error and self.state == State.RECORDING:
+            logger.info(f"WebSocket failed during recording, triggering failure handler")
             await self._handle_recording_failure()
 
     async def handle_command(self, cmd: str) -> str:

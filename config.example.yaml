@@ -7,6 +7,9 @@ log_level: info
 # Long recordings may need more time to process
 transcription_timeout: 120
 
+# Seconds before alerting that a turn's transcription is stalled
+stall_alert_threshold: 10
+
 # VAD (Voice Activity Detection) settings
 vad:
   # Type: "server_vad" (volume-based) or "semantic_vad" (AI-based)
