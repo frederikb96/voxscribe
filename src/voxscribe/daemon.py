@@ -146,6 +146,7 @@ class VoxscribeDaemon:
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.recording_task: Optional[asyncio.Task[None]] = None
         self.shutdown_event = asyncio.Event()
+        self.force_stop_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
@@ -350,8 +351,13 @@ class VoxscribeDaemon:
         if self.state == State.IDLE:
             return False, "Not recording"
         if self.state == State.TRANSCRIBING:
-            return False, "Already stopping, please wait"
+            # Force stop: interrupt the transcription wait loop
+            logger.info("Force stop requested - aborting transcription wait")
+            self.force_stop_event.set()
+            return True, "Force stopping..."
 
+        # Clear force stop for normal stop flow
+        self.force_stop_event.clear()
         logger.info("Stopping recording")
         self.play_sound(SOUND_STOP)
         self.state = State.TRANSCRIBING
@@ -377,12 +383,17 @@ class VoxscribeDaemon:
             except Exception as e:
                 logger.error(f"Failed to send commit: {e}")
 
-        # Wait for transcriptions (event-driven)
+        # Wait for transcriptions (event-driven, interruptible by force_stop)
         wait_start = asyncio.get_event_loop().time()
         safety_timeout = self.config.get("transcription_timeout", 120)
+        wait_exit_reason = "completed"
 
         while self.pending_items and (asyncio.get_event_loop().time() - wait_start) < safety_timeout:
+            if self.force_stop_event.is_set():
+                wait_exit_reason = "force_stopped"
+                break
             if not self.websocket:
+                wait_exit_reason = "websocket_closed"
                 break
 
             try:
@@ -393,15 +404,26 @@ class VoxscribeDaemon:
                 continue
             except websockets.ConnectionClosed:
                 logger.warning("WebSocket closed while waiting")
+                wait_exit_reason = "websocket_closed"
                 break
             except Exception as e:
                 logger.error(f"Event recv error: {e}")
+                wait_exit_reason = "error"
                 break
 
-        if self.pending_items:
-            logger.warning(f"Exiting with {len(self.pending_items)} pending items")
-        else:
+        # Check if we exited due to timeout
+        if self.pending_items and wait_exit_reason == "completed":
+            wait_exit_reason = "timeout"
+
+        # Log exit reason
+        if wait_exit_reason == "completed":
             logger.info("All transcriptions complete")
+        elif wait_exit_reason == "force_stopped":
+            logger.info(f"Wait aborted by user ({len(self.pending_items)} items pending)")
+        elif wait_exit_reason == "timeout":
+            logger.warning(f"Timeout: exiting with {len(self.pending_items)} pending items")
+        else:
+            logger.warning(f"Wait ended ({wait_exit_reason}) with {len(self.pending_items)} pending")
 
         # Close websocket
         if self.websocket:
