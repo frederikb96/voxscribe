@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.voxscribe" path="/org/gnome/shell/extensions/voxscribe/">
+    <key name="label-max-width" type="i">
+      <default>150</default>
+      <range min="50" max="500"/>
+      <summary>Label maximum width</summary>
+      <description>Maximum width in pixels for the transcription preview in the panel</description>
+    </key>
+  </schema>
+</schemalist>

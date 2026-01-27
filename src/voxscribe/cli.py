@@ -3,12 +3,13 @@
 Voxscribe CLI - Command-line interface for the speech-to-text daemon.
 
 Usage:
-    voxscribe setup      Install systemd service and create config
-    voxscribe teardown   Remove systemd service
-    voxscribe start      Start recording
-    voxscribe stop       Stop recording
-    voxscribe toggle     Toggle recording (default)
-    voxscribe status     Check daemon status
+    voxscribe setup             Install systemd service and create config
+    voxscribe teardown          Remove systemd service
+    voxscribe install-extension Install GNOME Shell extension
+    voxscribe start             Start recording
+    voxscribe stop              Stop recording
+    voxscribe toggle            Toggle recording (default)
+    voxscribe status            Check daemon status
 """
 
 import os
@@ -168,6 +169,77 @@ def setup() -> int:
     return 0
 
 
+def install_extension() -> int:
+    """Install GNOME Shell extension."""
+    import importlib.resources
+
+    print("Installing GNOME Shell extension...")
+
+    # Extension destination
+    ext_dir = Path.home() / ".local" / "share" / "gnome-shell" / "extensions" / "voxscribe@frederikb.github.com"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the extension source directory
+    # Try to find it relative to the package
+    try:
+        # When installed via pipx, use importlib.resources
+        package_dir = Path(__file__).parent.parent.parent
+        ext_src = package_dir / "extension"
+        if not ext_src.exists():
+            # Fallback: try finding it from cwd
+            ext_src = Path.cwd() / "extension"
+        if not ext_src.exists():
+            print("  ERROR: Extension source not found")
+            print("  Run this command from the voxscribe repository root")
+            return 1
+    except Exception as e:
+        print(f"  ERROR: Could not locate extension: {e}")
+        return 1
+
+    # Copy extension files
+    files_to_copy = ["extension.js", "metadata.json", "stylesheet.css", "prefs.js"]
+    for filename in files_to_copy:
+        src = ext_src / filename
+        if src.exists():
+            shutil.copy(src, ext_dir / filename)
+            print(f"  Copied: {filename}")
+        else:
+            print(f"  WARNING: Missing {filename}")
+
+    # Copy and compile schema
+    schema_src = ext_src / "schemas"
+    schema_dst = ext_dir / "schemas"
+    if schema_src.exists():
+        schema_dst.mkdir(exist_ok=True)
+        for schema_file in schema_src.glob("*.xml"):
+            shutil.copy(schema_file, schema_dst / schema_file.name)
+            print(f"  Copied: schemas/{schema_file.name}")
+
+        # Compile schemas
+        try:
+            result = subprocess.run(
+                ["glib-compile-schemas", str(schema_dst)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                print("  Compiled schemas")
+            else:
+                print(f"  ERROR: Schema compilation failed: {result.stderr}")
+                return 1
+        except FileNotFoundError:
+            print("  ERROR: glib-compile-schemas not found")
+            print("  Install: sudo apt install libglib2.0-dev-bin")
+            return 1
+
+    print(f"\nExtension installed to: {ext_dir}")
+    print("\nTo activate:")
+    print("  1. Log out and log back in (or restart GNOME Shell: Alt+F2, 'r', Enter on X11)")
+    print("  2. Enable extension: gnome-extensions enable voxscribe@frederikb.github.com")
+    print("  3. Open settings: gnome-extensions prefs voxscribe@frederikb.github.com")
+    return 0
+
+
 def teardown() -> int:
     """Remove systemd service."""
     print("Removing voxscribe service...")
@@ -226,6 +298,8 @@ def main() -> NoReturn:
         sys.exit(setup())
     elif cmd == "teardown":
         sys.exit(teardown())
+    elif cmd == "install-extension":
+        sys.exit(install_extension())
 
     # Daemon commands
     if cmd not in ("start", "stop", "status", "toggle"):

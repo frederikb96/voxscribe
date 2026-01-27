@@ -6,9 +6,13 @@
  *
  * States:
  * - idle: Indicator hidden
- * - recording: Red mic icon + last transcription text
- * - transcribing: Spinner icon + "Processing..."
- * - done: Check icon + "Copied!" (auto-hides after 5 seconds)
+ * - recording: Red mic icon + transcription preview
+ * - transcribing: Yellow spinner + "Processing..."
+ * - done: Green check + "Copied!" (auto-hides after 5 seconds)
+ * - partial: Orange warning + "Partial!" (auto-hides)
+ * - error: Red error + "Error!" (auto-hides)
+ *
+ * Click opens popup with full text and copy button.
  */
 
 import Clutter from "gi://Clutter";
@@ -20,6 +24,7 @@ import St from "gi://St";
 import { Extension } from "resource:///org/gnome/shell/extensions/extension.js";
 import * as Main from "resource:///org/gnome/shell/ui/main.js";
 import * as PanelMenu from "resource:///org/gnome/shell/ui/panelMenu.js";
+import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
 
 // DBus configuration - must match daemon
 const DBUS_NAME = "com.github.frederikb.Voxscribe";
@@ -28,6 +33,7 @@ const DBUS_INTERFACE = "com.github.frederikb.Voxscribe";
 
 // Icon names for each state
 const ICONS = {
+  idle: "audio-input-microphone-symbolic",
   recording: "media-record-symbolic",
   transcribing: "emblem-synchronizing-symbolic",
   done: "emblem-ok-symbolic",
@@ -35,10 +41,26 @@ const ICONS = {
   error: "dialog-error-symbolic",
 };
 
+// States that auto-hide after delay
+const AUTO_HIDE_STATES = {
+  done: { label: "Copied!", seconds: 5 },
+  partial: { label: "Partial!", seconds: 5 },
+  error: { label: "Error!", seconds: 5 },
+};
+
+// All possible state classes for cleanup
+const STATE_CLASSES = ["recording", "transcribing", "done", "partial", "error"];
+
 const VoxscribeIndicator = GObject.registerClass(
   class VoxscribeIndicator extends PanelMenu.Button {
-    _init() {
+    _init(settings) {
       super._init(0.0, "Voxscribe Indicator", false);
+
+      this._settings = settings;
+      this._fullText = "";
+      this._state = "idle";
+      this._hideTimeoutId = null;
+      this._dbusSignalId = null;
 
       // Container box for icon + label
       this._box = new St.BoxLayout({
@@ -48,12 +70,12 @@ const VoxscribeIndicator = GObject.registerClass(
 
       // Icon
       this._icon = new St.Icon({
-        icon_name: ICONS.recording,
+        icon_name: ICONS.idle,
         style_class: "system-status-icon",
       });
       this._box.add_child(this._icon);
 
-      // Label for transcription preview
+      // Label for transcription preview (CSS handles truncation)
       this._label = new St.Label({
         text: "",
         y_align: Clutter.ActorAlign.CENTER,
@@ -61,13 +83,85 @@ const VoxscribeIndicator = GObject.registerClass(
       });
       this._box.add_child(this._label);
 
+      // Apply width setting
+      this._applyWidthSetting();
+
+      // Watch for setting changes
+      this._settingsChangedId = this._settings.connect(
+        "changed::label-max-width",
+        () => this._applyWidthSetting()
+      );
+
+      // Build popup menu
+      this._buildMenu();
+
       // Start hidden
       this.hide();
+    }
 
-      // State tracking
-      this._state = "idle";
-      this._hideTimeoutId = null;
-      this._dbusSignalId = null;
+    /**
+     * Apply width setting to label (only max-width is dynamic).
+     */
+    _applyWidthSetting() {
+      const maxWidth = this._settings.get_int("label-max-width");
+      this._label.set_style(`max-width: ${maxWidth}px;`);
+    }
+
+    /**
+     * Build the popup menu with full text and copy button.
+     */
+    _buildMenu() {
+      // Full text display (scrollable)
+      this._textItem = new PopupMenu.PopupBaseMenuItem({
+        reactive: false,
+        can_focus: false,
+      });
+
+      // ScrollView for long text (sizing in CSS)
+      this._scrollView = new St.ScrollView({
+        style_class: "voxscribe-scroll",
+        hscrollbar_policy: St.PolicyType.NEVER,
+        vscrollbar_policy: St.PolicyType.AUTOMATIC,
+      });
+
+      this._textLabel = new St.Label({
+        text: "No transcription yet",
+        style_class: "voxscribe-popup-text",
+      });
+      this._textLabel.clutter_text.set_line_wrap(true);
+      this._textLabel.clutter_text.set_line_wrap_mode(0); // WORD
+      this._textLabel.clutter_text.set_selectable(true);
+
+      // Wrap label in BoxLayout for ScrollView compatibility
+      const textBox = new St.BoxLayout({ vertical: true });
+      textBox.add_child(this._textLabel);
+      this._scrollView.set_child(textBox);
+      this._textItem.add_child(this._scrollView);
+      this.menu.addMenuItem(this._textItem);
+
+      // Separator
+      this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+      // Copy button
+      this._copyItem = new PopupMenu.PopupMenuItem("Copy to Clipboard");
+      this._copyItem.connect("activate", () => this._copyToClipboard());
+      this.menu.addMenuItem(this._copyItem);
+    }
+
+    /**
+     * Copy full text to clipboard using native St.Clipboard.
+     */
+    _copyToClipboard() {
+      if (!this._fullText) {
+        return;
+      }
+
+      try {
+        const clipboard = St.Clipboard.get_default();
+        clipboard.set_text(St.ClipboardType.CLIPBOARD, this._fullText);
+      } catch (e) {
+        log(`[Voxscribe] Clipboard copy failed: ${e}`);
+      }
     }
 
     /**
@@ -88,6 +182,34 @@ const VoxscribeIndicator = GObject.registerClass(
       } catch (e) {
         log(`[Voxscribe] DBus connection failed: ${e}`);
       }
+    }
+
+    /**
+     * Fetch initial state from daemon (in case recording is already active).
+     */
+    fetchInitialStatus() {
+      Gio.DBus.session.call(
+        DBUS_NAME,
+        DBUS_PATH,
+        DBUS_INTERFACE,
+        "GetStatus",
+        null,
+        new GLib.VariantType("(ss)"),
+        Gio.DBusCallFlags.NONE,
+        1000,
+        null,
+        (connection, result) => {
+          try {
+            const reply = connection.call_finish(result);
+            const [state, text] = reply.deepUnpack();
+            log(`[Voxscribe] Initial status: ${state}`);
+            this._updateState(state, text);
+          } catch (e) {
+            // Daemon not running - that's fine, stay hidden
+            log(`[Voxscribe] Could not fetch initial status: ${e.message}`);
+          }
+        }
+      );
     }
 
     /**
@@ -118,7 +240,14 @@ const VoxscribeIndicator = GObject.registerClass(
 
       this._state = state;
 
+      // Update CSS classes for state-based styling
+      STATE_CLASSES.forEach((cls) => this._box.remove_style_class_name(cls));
+      if (state !== "idle") {
+        this._box.add_style_class_name(state);
+      }
+
       if (state === "idle") {
+        this._icon.set_icon_name(ICONS.idle);
         this.hide();
         return;
       }
@@ -131,70 +260,51 @@ const VoxscribeIndicator = GObject.registerClass(
         this._icon.set_icon_name(ICONS[state]);
       }
 
-      // Update label based on state
-      switch (state) {
-        case "recording":
-          // Show last ~15 chars of transcription
-          if (text && text.length > 0) {
-            const preview = text.length > 15 ? "..." + text.slice(-12) : text;
-            this._label.set_text(preview);
-          } else {
-            this._label.set_text("Recording...");
-          }
-          break;
+      // Handle state-specific behavior
+      if (state === "recording") {
+        if (text && text.length > 0) {
+          this._fullText = text;
+          this._textLabel.set_text(text);
+          this._label.set_text(text); // CSS handles truncation
+        } else {
+          // New recording started - clear stale text
+          this._fullText = "";
+          this._textLabel.set_text("Recording...");
+          this._label.set_text("Recording...");
+        }
+      } else if (state === "transcribing") {
+        this._label.set_text("Processing...");
+        // Keep _fullText and popup text as-is (show last known text)
+      } else if (AUTO_HIDE_STATES[state]) {
+        // done, partial, error states
+        const config = AUTO_HIDE_STATES[state];
+        this._label.set_text(config.label);
 
-        case "transcribing":
-          this._label.set_text("Processing...");
-          break;
+        // Update popup with final text if provided
+        if (text && text.length > 0) {
+          this._fullText = text;
+          this._textLabel.set_text(text);
+        }
 
-        case "done":
-          this._label.set_text("Copied!");
-          // Auto-hide after 5 seconds (only if still in done state)
-          this._hideTimeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            5,
-            () => {
-              if (this._state === "done") {
-                this.hide();
-              }
-              this._hideTimeoutId = null;
-              return GLib.SOURCE_REMOVE;
-            }
-          );
-          break;
-
-        case "partial":
-          this._label.set_text("Partial!");
-          // Auto-hide after 5 seconds (only if still in partial state)
-          this._hideTimeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            5,
-            () => {
-              if (this._state === "partial") {
-                this.hide();
-              }
-              this._hideTimeoutId = null;
-              return GLib.SOURCE_REMOVE;
-            }
-          );
-          break;
-
-        case "error":
-          this._label.set_text("Error!");
-          // Auto-hide after 5 seconds (only if still in error state)
-          this._hideTimeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            5,
-            () => {
-              if (this._state === "error") {
-                this.hide();
-              }
-              this._hideTimeoutId = null;
-              return GLib.SOURCE_REMOVE;
-            }
-          );
-          break;
+        this._scheduleHide(config.seconds, state);
       }
+    }
+
+    /**
+     * Schedule auto-hide after delay if still in given state.
+     */
+    _scheduleHide(seconds, requiredState) {
+      this._hideTimeoutId = GLib.timeout_add_seconds(
+        GLib.PRIORITY_DEFAULT,
+        seconds,
+        () => {
+          if (this._state === requiredState) {
+            this.hide();
+          }
+          this._hideTimeoutId = null;
+          return GLib.SOURCE_REMOVE;
+        }
+      );
     }
 
     /**
@@ -213,6 +323,12 @@ const VoxscribeIndicator = GObject.registerClass(
     destroy() {
       this._clearHideTimeout();
       this.disconnectDbus();
+
+      if (this._settingsChangedId) {
+        this._settings.disconnect(this._settingsChangedId);
+        this._settingsChangedId = null;
+      }
+
       super.destroy();
     }
   }
@@ -220,9 +336,11 @@ const VoxscribeIndicator = GObject.registerClass(
 
 export default class VoxscribeExtension extends Extension {
   enable() {
-    this._indicator = new VoxscribeIndicator();
+    this._settings = this.getSettings();
+    this._indicator = new VoxscribeIndicator(this._settings);
     Main.panel.addToStatusArea(this.uuid, this._indicator);
     this._indicator.connectDbus();
+    this._indicator.fetchInitialStatus();
     log("[Voxscribe] Extension enabled");
   }
 
@@ -231,6 +349,7 @@ export default class VoxscribeExtension extends Extension {
       this._indicator.destroy();
       this._indicator = null;
     }
+    this._settings = null;
     log("[Voxscribe] Extension disabled");
   }
 }

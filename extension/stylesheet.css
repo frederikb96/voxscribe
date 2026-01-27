@@ -1,17 +1,47 @@
 /* Voxscribe GNOME Shell Extension Styles */
 
+/* Panel label - uses CSS truncation instead of JS calculation */
 .voxscribe-label {
   margin-left: 6px;
   font-size: 11px;
   color: #cccccc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* Recording state - subtle red tint */
-.panel-status-menu-box:recording .system-status-icon {
+/* State-based icon colors (use .state not :state) */
+.panel-status-menu-box.recording .system-status-icon {
   color: #ff6b6b;
 }
 
-/* Done state - green tint */
-.panel-status-menu-box:done .system-status-icon {
+.panel-status-menu-box.transcribing .system-status-icon {
+  color: #feca57;
+}
+
+.panel-status-menu-box.done .system-status-icon {
   color: #69db7c;
+}
+
+.panel-status-menu-box.partial .system-status-icon {
+  color: #ffa94d;
+}
+
+.panel-status-menu-box.error .system-status-icon {
+  color: #ff6b6b;
+}
+
+/* Popup scroll container */
+.voxscribe-scroll {
+  background-color: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  max-height: 300px;
+  min-width: 350px;
+}
+
+/* Popup text */
+.voxscribe-popup-text {
+  font-size: 12px;
+  color: #eeeeee;
+  padding: 8px;
 }
