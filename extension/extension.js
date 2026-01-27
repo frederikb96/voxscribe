@@ -108,6 +108,21 @@ const VoxscribeIndicator = GObject.registerClass(
     }
 
     /**
+     * Truncate text from START, showing the END (most recent speech).
+     * Returns "...last part of text" format.
+     */
+    _truncateStart(text) {
+      const maxWidth = this._settings.get_int("label-max-width");
+      // Rough estimate: ~7px per char at 11px font
+      const maxChars = Math.floor(maxWidth / 7);
+
+      if (text.length <= maxChars) {
+        return text;
+      }
+      return "..." + text.slice(-(maxChars - 3));
+    }
+
+    /**
      * Build the popup menu with full text and copy button.
      */
     _buildMenu() {
@@ -127,13 +142,19 @@ const VoxscribeIndicator = GObject.registerClass(
       this._textLabel = new St.Label({
         text: "No transcription yet",
         style_class: "voxscribe-popup-text",
+        x_expand: true,
       });
       this._textLabel.clutter_text.set_line_wrap(true);
       this._textLabel.clutter_text.set_line_wrap_mode(0); // WORD
       this._textLabel.clutter_text.set_selectable(true);
 
       // Wrap label in BoxLayout for ScrollView compatibility
-      const textBox = new St.BoxLayout({ vertical: true });
+      // BoxLayout constrains width, enabling proper text wrap
+      const textBox = new St.BoxLayout({
+        vertical: true,
+        x_expand: true,
+        style: "max-width: 400px;",
+      });
       textBox.add_child(this._textLabel);
       this._scrollView.set_child(textBox);
       this._textItem.add_child(this._scrollView);
@@ -265,7 +286,8 @@ const VoxscribeIndicator = GObject.registerClass(
         if (text && text.length > 0) {
           this._fullText = text;
           this._textLabel.set_text(text);
-          this._label.set_text(text); // CSS handles truncation
+          // Show END of text in panel (most recent speech)
+          this._label.set_text(this._truncateStart(text));
         } else {
           // New recording started - clear stale text
           this._fullText = "";
