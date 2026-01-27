@@ -170,7 +170,7 @@ class VoxscribeDaemon:
     def emit_state(self, state: str, text: str = "") -> None:
         """Emit state change via DBus."""
         if self.dbus_interface:
-            self.dbus_interface.emit_state(state, text[-50:] if text else "")
+            self.dbus_interface.emit_state(state, text)
 
     def load_api_key(self) -> bool:
         """Load OpenAI API key from environment variable."""
