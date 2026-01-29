@@ -35,6 +35,8 @@ def get_service_content() -> str:
     return f"""[Unit]
 Description=Voxscribe - Real-time speech-to-text daemon
 After=graphical-session.target
+PartOf=graphical-session.target
+BindsTo=graphical-session.target
 
 [Service]
 Type=simple
