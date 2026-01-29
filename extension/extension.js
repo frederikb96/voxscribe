@@ -167,6 +167,11 @@ const VoxscribeIndicator = GObject.registerClass(
       this._copyItem = new PopupMenu.PopupMenuItem("Copy to Clipboard");
       this._copyItem.connect("activate", () => this._copyToClipboard());
       this.menu.addMenuItem(this._copyItem);
+
+      // Refresh button (recovery from frozen UI state)
+      this._refreshItem = new PopupMenu.PopupMenuItem("Refresh");
+      this._refreshItem.connect("activate", () => this.fetchInitialStatus());
+      this.menu.addMenuItem(this._refreshItem);
     }
 
     /**
