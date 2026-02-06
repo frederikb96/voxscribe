@@ -361,7 +361,7 @@ class VoxscribeDaemon:
         logger.info("Stopping recording")
         self.play_sound(SOUND_STOP)
         self.state = State.TRANSCRIBING
-        self.emit_state("transcribing", self._get_current_text())
+        self.emit_state("transcribing", self._get_current_text()[-500:])
 
         # Cancel recording task first to free websocket recv
         if self.recording_task and not self.recording_task.done():
@@ -491,7 +491,6 @@ class VoxscribeDaemon:
             if item_id and delta:
                 self.transcripts[item_id] = self.transcripts.get(item_id, "") + delta
                 self._write_result_file()
-                self.emit_state("recording", self._get_current_text())
 
         elif t == "conversation.item.input_audio_transcription.completed":
             transcript = ev.get("transcript", "")
@@ -507,7 +506,7 @@ class VoxscribeDaemon:
                 else:
                     logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
                 self._write_result_file()
-                self.emit_state("recording", self._get_current_text())
+                self.emit_state("recording", self._get_current_text()[-500:])
 
         elif t == "input_audio_buffer.committed":
             committed_item_id = ev.get("item_id", "")

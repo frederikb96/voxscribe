@@ -172,6 +172,13 @@ const VoxscribeIndicator = GObject.registerClass(
       this._refreshItem = new PopupMenu.PopupMenuItem("Refresh");
       this._refreshItem.connect("activate", () => this.fetchInitialStatus());
       this.menu.addMenuItem(this._refreshItem);
+
+      // Fetch full text when popup opens
+      this.menu.connect("open-state-changed", (_menu, isOpen) => {
+        if (isOpen && this._state === "recording") {
+          this._fetchFullText();
+        }
+      });
     }
 
     /**
@@ -239,6 +246,35 @@ const VoxscribeIndicator = GObject.registerClass(
     }
 
     /**
+     * Fetch full text from daemon for popup display.
+     */
+    _fetchFullText() {
+      Gio.DBus.session.call(
+        DBUS_NAME,
+        DBUS_PATH,
+        DBUS_INTERFACE,
+        "GetStatus",
+        null,
+        new GLib.VariantType("(ss)"),
+        Gio.DBusCallFlags.NONE,
+        1000,
+        null,
+        (connection, result) => {
+          try {
+            const reply = connection.call_finish(result);
+            const [_state, text] = reply.deepUnpack();
+            if (text && text.length > 0) {
+              this._fullText = text;
+              this._textLabel.set_text(text);
+            }
+          } catch (e) {
+            log(`[Voxscribe] Could not fetch full text: ${e.message}`);
+          }
+        }
+      );
+    }
+
+    /**
      * Unsubscribe from DBus signals.
      */
     disconnectDbus() {
@@ -289,8 +325,6 @@ const VoxscribeIndicator = GObject.registerClass(
       // Handle state-specific behavior
       if (state === "recording") {
         if (text && text.length > 0) {
-          this._fullText = text;
-          this._textLabel.set_text(text);
           // Show END of text in panel (most recent speech)
           this._label.set_text(this._truncateStart(text));
         } else {
