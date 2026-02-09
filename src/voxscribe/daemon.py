@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import websockets
 import yaml
@@ -106,27 +106,32 @@ class State(Enum):
 if DBUS_AVAILABLE:
 
     class VoxscribeDBusInterface(ServiceInterface):
-        """DBus interface for status updates to GNOME extension."""
+        """DBus interface for status updates to GNOME extension.
 
-        def __init__(self) -> None:
+        Signals carry truncated text for efficient panel display.
+        GetStatus returns full text on demand (for popup/copy).
+        """
+
+        def __init__(self, text_provider: "Callable[[], str]") -> None:
             super().__init__(DBUS_NAME)
             self._state = "idle"
-            self._text = ""
+            self._signal_text = ""
+            self._text_provider = text_provider
 
         @dbus_signal()
         def StateChanged(self) -> "ss":
-            """Signal emitted when state changes. Returns (state, text)."""
-            return [self._state, self._text]
+            """Signal emitted when state changes. Returns (state, truncated_text)."""
+            return [self._state, self._signal_text]
 
         @method()
         def GetStatus(self) -> "ss":
-            """Get current state and last transcription text."""
-            return [self._state, self._text]
+            """Get current state and full transcription text."""
+            return [self._state, self._text_provider()]
 
         def emit_state(self, state: str, text: str = "") -> None:
-            """Emit state change signal."""
+            """Emit state change signal with truncated text for panel display."""
             self._state = state
-            self._text = text
+            self._signal_text = text
             self.StateChanged()
 
 
@@ -159,7 +164,7 @@ class VoxscribeDaemon:
 
         try:
             self.dbus_bus = await MessageBus().connect()
-            self.dbus_interface = VoxscribeDBusInterface()
+            self.dbus_interface = VoxscribeDBusInterface(self._get_current_text)
             self.dbus_bus.export(DBUS_PATH, self.dbus_interface)
             await self.dbus_bus.request_name(DBUS_NAME)
             logger.info(f"DBus service registered: {DBUS_NAME}")
@@ -452,10 +457,10 @@ class VoxscribeDaemon:
             lost_count = len(self.failed_items) + len(self.pending_items)
             logger.warning(f"Partial transcription: {lost_count} items failed/pending")
             self.play_sound(SOUND_ERROR)
-            self.emit_state("partial", result[-50:] if result else "")
+            self.emit_state("partial")
         else:
             self.play_sound(SOUND_DONE)
-            self.emit_state("done", result[-50:] if result else "")
+            self.emit_state("done")
 
         self.state = State.IDLE
 
@@ -556,9 +561,9 @@ class VoxscribeDaemon:
 
         # Notify user of failure
         self.play_sound(SOUND_ERROR)
-        self.emit_state("partial", result[-50:] if result else "Connection lost")
+        self.emit_state("partial")
         self.state = State.IDLE
-        asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
+        asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle"))
 
     async def _alert_transcription_stall(self, item_id: str, age: float) -> None:
         """Alert user that transcription is stalled during recording."""

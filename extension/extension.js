@@ -173,9 +173,9 @@ const VoxscribeIndicator = GObject.registerClass(
       this._refreshItem.connect("activate", () => this.fetchInitialStatus());
       this.menu.addMenuItem(this._refreshItem);
 
-      // Fetch full text when popup opens
+      // Fetch full text from daemon when popup opens
       this.menu.connect("open-state-changed", (_menu, isOpen) => {
-        if (isOpen && this._state === "recording") {
+        if (isOpen && this._state !== "idle") {
           this._fetchFullText();
         }
       });
@@ -337,16 +337,8 @@ const VoxscribeIndicator = GObject.registerClass(
         this._label.set_text("Processing...");
         // Keep _fullText and popup text as-is (show last known text)
       } else if (AUTO_HIDE_STATES[state]) {
-        // done, partial, error states
         const config = AUTO_HIDE_STATES[state];
         this._label.set_text(config.label);
-
-        // Update popup with final text if provided
-        if (text && text.length > 0) {
-          this._fullText = text;
-          this._textLabel.set_text(text);
-        }
-
         this._scheduleHide(config.seconds, state);
       }
     }
