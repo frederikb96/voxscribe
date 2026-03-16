@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Voxscribe Daemon - Streaming speech-to-text using OpenAI Realtime API.
+Voxscribe Daemon - Streaming speech-to-text with provider abstraction.
 
 Runs as a systemd user service, listens on Unix socket for commands.
 Commands: START, STOP, STATUS, TOGGLE
@@ -9,20 +9,20 @@ Emits DBus signals for GNOME extension integration.
 """
 
 import asyncio
-import base64
-import json
 import logging
 import os
 import signal
-import subprocess
 import sys
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import websockets
 import yaml
+
+from voxscribe.providers import TranscriptionProvider, create_provider
+from voxscribe.silence_gate import SilenceAction, SilenceGate
 
 try:
     from dbus_next.aio import MessageBus
@@ -88,6 +88,31 @@ def load_config() -> dict[str, Any]:
         with open(CONFIG_FILE) as f:
             config = yaml.safe_load(f)
         logger.info(f"Config loaded from {CONFIG_FILE}")
+
+        # Backward compatibility: migrate old format
+        if "provider" not in config:
+            config["provider"] = "openai"
+        if "openai" not in config and "transcription" in config:
+            old_t = config.pop("transcription")
+            old_v = config.pop("vad", {})
+            oai: dict[str, Any] = {}
+            if "model" in old_t:
+                oai["model"] = old_t["model"]
+            if "prompt" in old_t:
+                oai["prompt"] = old_t["prompt"]
+            if old_t.get("language"):
+                config.setdefault("language", old_t["language"])
+            if "type" in old_v:
+                oai["vad_type"] = old_v["type"]
+            if "threshold" in old_v:
+                oai["vad_threshold"] = old_v["threshold"]
+            if "prefix_padding_ms" in old_v:
+                oai["vad_prefix_padding_ms"] = old_v["prefix_padding_ms"]
+            if "silence_duration_ms" in old_v:
+                oai["vad_silence_duration_ms"] = old_v["silence_duration_ms"]
+            config["openai"] = oai
+            logger.info("Migrated old config format to new provider-based format")
+
         return config
     except Exception as e:
         logger.error(f"Failed to load config: {e}")
@@ -139,22 +164,19 @@ class VoxscribeDaemon:
     """Main daemon class managing recording and transcription."""
 
     def __init__(self, config: dict[str, Any]) -> None:
-        """Initialize daemon with configuration."""
         self.state = State.IDLE
         self.api_key: str = ""
         self.config = config
-        self.transcripts: dict[str, str] = {}
-        self.pending_items: set[str] = set()
-        self.failed_items: set[str] = set()
-        self.item_creation_times: dict[str, float] = {}
+        self.provider: Optional[TranscriptionProvider] = None
+        self.silence_gate: Optional[SilenceGate] = None
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.recording_task: Optional[asyncio.Task[None]] = None
         self.shutdown_event = asyncio.Event()
         self.force_stop_event = asyncio.Event()
         self.current_output_file: Optional[Path] = None
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
+        self._websocket_error: bool = False
 
     async def setup_dbus(self) -> None:
         """Set up DBus service for GNOME extension communication."""
@@ -178,12 +200,15 @@ class VoxscribeDaemon:
             self.dbus_interface.emit_state(state, text)
 
     def load_api_key(self) -> bool:
-        """Load OpenAI API key from environment variable."""
-        self.api_key = os.environ.get("OPENAI_API_KEY", "")
+        """Load API key from environment based on configured provider."""
+        provider_name = self.config.get("provider", "openai")
+        env_var = "OPENAI_API_KEY" if provider_name == "openai" else "ELEVENLABS_API_KEY"
+
+        self.api_key = os.environ.get(env_var, "")
         if self.api_key:
-            logger.info("API key loaded from environment")
+            logger.info(f"API key loaded from {env_var}")
             return True
-        logger.error("OPENAI_API_KEY environment variable not set")
+        logger.error(f"{env_var} environment variable not set")
         return False
 
     async def _terminate_pw_record(self) -> None:
@@ -208,6 +233,8 @@ class VoxscribeDaemon:
 
     def play_sound(self, sound_file: Path) -> None:
         """Play sound file asynchronously (non-blocking)."""
+        import subprocess
+
         if sound_file.exists():
             try:
                 subprocess.Popen(
@@ -220,6 +247,8 @@ class VoxscribeDaemon:
 
     def copy_to_clipboard(self, text: str) -> bool:
         """Copy text to clipboard using wl-copy."""
+        import subprocess
+
         try:
             subprocess.Popen(
                 ["wl-copy", "--", text],
@@ -237,6 +266,16 @@ class VoxscribeDaemon:
             logger.error(f"Clipboard copy failed: {e}")
             return False
 
+    def _on_text_update(self, text: str) -> None:
+        """Provider callback: transcript text updated."""
+        self._write_result_file()
+        self.emit_state("recording", text[-500:])
+
+    def _on_provider_error(self, msg: str) -> None:
+        """Provider callback: error occurred."""
+        logger.error(f"Provider error: {msg}")
+        self._websocket_error = True
+
     async def start_recording(self) -> tuple[bool, str]:
         """Start recording and transcription session."""
         if self.state != State.IDLE:
@@ -247,10 +286,7 @@ class VoxscribeDaemon:
         self.play_sound(SOUND_START)
         self.emit_state("recording", "")
         logger.info("Starting recording session")
-        self.transcripts = {}
-        self.pending_items = set()
-        self.failed_items = set()
-        self.item_creation_times = {}
+        self._websocket_error = False
 
         # Create timestamped output file and update symlink
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -259,6 +295,27 @@ class VoxscribeDaemon:
         RESULT_SYMLINK.unlink(missing_ok=True)
         RESULT_SYMLINK.symlink_to(self.current_output_file)
         logger.info(f"Output file: {self.current_output_file.name}")
+
+        # Create provider
+        try:
+            self.provider = create_provider(self.config, self.api_key)
+            self.provider.on_ready = lambda: logger.info("Provider ready")
+            self.provider.on_text_update = self._on_text_update
+            self.provider.on_error = self._on_provider_error
+        except Exception as e:
+            logger.error(f"Failed to create provider: {e}")
+            self.play_sound(SOUND_ERROR)
+            self.emit_state("error", "")
+            self.state = State.IDLE
+            asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
+            return False, f"Failed to create provider: {e}"
+
+        # Create silence gate (only active for elevenlabs when enabled)
+        provider_name = self.config.get("provider", "openai")
+        if provider_name == "elevenlabs":
+            self.silence_gate = SilenceGate(self.config)
+        else:
+            self.silence_gate = None
 
         # Start pw-record
         try:
@@ -283,70 +340,19 @@ class VoxscribeDaemon:
             asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
             return False, f"Failed to start audio capture: {e}"
 
-        # Connect to OpenAI
+        # Connect provider (handles WebSocket internally)
         try:
-            url = "wss://api.openai.com/v1/realtime?intent=transcription"
-            headers = {"Authorization": f"Bearer {self.api_key}", "OpenAI-Beta": "realtime=v1"}
-            self.websocket = await asyncio.wait_for(
-                websockets.connect(url, additional_headers=headers, max_size=None),
-                timeout=10,
-            )
-            logger.info("WebSocket connected")
-
-            # Wait for session.created
-            msg = await asyncio.wait_for(self.websocket.recv(), timeout=5)
-            ev = json.loads(msg)
-            logger.debug(f"Received: {ev.get('type')}")
-
-            # Configure session - only include values that are set in config
-            vad_config = self.config.get("vad", {})
-            transcription_config = self.config.get("transcription", {})
-
-            # Transcription settings - model is required
-            if "model" not in transcription_config:
-                raise ValueError("transcription.model is required in config")
-            transcription_settings: dict[str, Any] = {"model": transcription_config["model"]}
-            if transcription_config.get("prompt"):
-                transcription_settings["prompt"] = transcription_config["prompt"]
-            if transcription_config.get("language"):
-                transcription_settings["language"] = transcription_config["language"]
-
-            # VAD settings - only include values that are set, let OpenAI use defaults
-            turn_detection: dict[str, Any] = {"type": vad_config.get("type", "server_vad")}
-            if "threshold" in vad_config:
-                turn_detection["threshold"] = vad_config["threshold"]
-            if "prefix_padding_ms" in vad_config:
-                turn_detection["prefix_padding_ms"] = vad_config["prefix_padding_ms"]
-            if "silence_duration_ms" in vad_config:
-                turn_detection["silence_duration_ms"] = vad_config["silence_duration_ms"]
-
-            session_config: dict[str, Any] = {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": transcription_settings,
-                "turn_detection": turn_detection,
-            }
-
-            logger.info(f"VAD: {turn_detection.get('type')}, config keys: {list(turn_detection.keys())}")
-            if transcription_config.get("prompt"):
-                logger.debug(f"Prompt: {transcription_config['prompt'][:80]}...")
-
-            await self.websocket.send(
-                json.dumps({"type": "transcription_session.update", "session": session_config})
-            )
-            msg = await asyncio.wait_for(self.websocket.recv(), timeout=5)
-            ev = json.loads(msg)
-            logger.debug(f"Session configured: {ev.get('type')}")
-
+            await self.provider.connect()
         except Exception as e:
-            logger.error(f"Failed to connect to OpenAI: {e}")
+            logger.error(f"Failed to connect provider: {e}")
             await self._terminate_pw_record()
             self.play_sound(SOUND_ERROR)
             self.emit_state("error", "")
             self.state = State.IDLE
             asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
-            return False, f"Failed to connect to OpenAI: {e}"
+            return False, f"Failed to connect to transcription service: {e}"
 
-        # Start recording tasks
+        # Start recording loop task
         self.recording_task = asyncio.create_task(self._recording_loop())
         logger.info("Recording started")
         return True, "Recording started"
@@ -356,7 +362,6 @@ class VoxscribeDaemon:
         if self.state == State.IDLE:
             return False, "Not recording"
         if self.state == State.TRANSCRIBING:
-            # Force stop: interrupt the transcription wait loop
             logger.info("Force stop requested - aborting transcription wait")
             self.force_stop_event.set()
             return True, "Force stopping..."
@@ -368,7 +373,7 @@ class VoxscribeDaemon:
         self.state = State.TRANSCRIBING
         self.emit_state("transcribing", self._get_current_text()[-500:])
 
-        # Cancel recording task first to free websocket recv
+        # Cancel recording task first
         if self.recording_task and not self.recording_task.done():
             self.recording_task.cancel()
             try:
@@ -381,66 +386,39 @@ class VoxscribeDaemon:
         await self._terminate_pw_record()
 
         # Send commit to force transcription
-        if self.websocket:
-            try:
-                await self.websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                logger.info("Sent audio commit")
-            except Exception as e:
-                logger.error(f"Failed to send commit: {e}")
+        if self.provider:
+            await self.provider.commit()
 
-        # Wait for transcriptions (event-driven, interruptible by force_stop)
-        wait_start = asyncio.get_event_loop().time()
+        # Wait for pending transcriptions
+        wait_start = time.monotonic()
         safety_timeout = self.config.get("transcription_timeout", 120)
         wait_exit_reason = "completed"
 
-        while self.pending_items and (asyncio.get_event_loop().time() - wait_start) < safety_timeout:
+        while self.provider and self.provider.has_pending() and (time.monotonic() - wait_start) < safety_timeout:
             if self.force_stop_event.is_set():
                 wait_exit_reason = "force_stopped"
                 break
-            if not self.websocket:
-                wait_exit_reason = "websocket_closed"
-                break
-
-            try:
-                msg = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
-                self._handle_event(json.loads(msg))
-            except asyncio.TimeoutError:
-                logger.debug(f"Waiting for {len(self.pending_items)} pending transcriptions...")
-                continue
-            except websockets.ConnectionClosed:
-                logger.warning("WebSocket closed while waiting")
-                wait_exit_reason = "websocket_closed"
-                break
-            except Exception as e:
-                logger.error(f"Event recv error: {e}")
-                wait_exit_reason = "error"
-                break
+            await asyncio.sleep(0.2)
 
         # Check if we exited due to timeout
-        if self.pending_items and wait_exit_reason == "completed":
+        if self.provider and self.provider.has_pending() and wait_exit_reason == "completed":
             wait_exit_reason = "timeout"
 
-        # Log exit reason
         if wait_exit_reason == "completed":
             logger.info("All transcriptions complete")
         elif wait_exit_reason == "force_stopped":
-            logger.info(f"Wait aborted by user ({len(self.pending_items)} items pending)")
+            logger.info("Wait aborted by user")
         elif wait_exit_reason == "timeout":
-            logger.warning(f"Timeout: exiting with {len(self.pending_items)} pending items")
+            logger.warning(f"Timeout: exiting with pending transcriptions")
         else:
-            logger.warning(f"Wait ended ({wait_exit_reason}) with {len(self.pending_items)} pending")
+            logger.warning(f"Wait ended ({wait_exit_reason})")
 
-        # Close websocket
-        if self.websocket:
-            try:
-                await asyncio.wait_for(self.websocket.close(), timeout=1)
-            except Exception:
-                pass
-            self.websocket = None
-            logger.info("WebSocket closed")
+        # Close provider
+        if self.provider:
+            await self.provider.close()
 
-        # Process result - always save whatever we have
-        result = " ".join(self.transcripts[k] for k in sorted(self.transcripts)).strip()
+        # Process result
+        result = self._get_current_text()
         logger.info(f"Final transcription: {len(result)} chars")
 
         if result:
@@ -451,11 +429,10 @@ class VoxscribeDaemon:
             clipboard_text = f"stt-rec: {result}"
             self.copy_to_clipboard(clipboard_text)
 
-        # Determine outcome and play appropriate sound
-        has_failures = bool(self.failed_items or self.pending_items)
+        # Determine outcome
+        has_failures = self.provider and self.provider.has_pending()
         if has_failures:
-            lost_count = len(self.failed_items) + len(self.pending_items)
-            logger.warning(f"Partial transcription: {lost_count} items failed/pending")
+            logger.warning("Partial transcription: pending items remain")
             self.play_sound(SOUND_ERROR)
             self.emit_state("partial")
         else:
@@ -463,8 +440,6 @@ class VoxscribeDaemon:
             self.emit_state("done")
 
         self.state = State.IDLE
-
-        # Schedule idle state emission after 5 seconds
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
 
         status = "partial" if has_failures else "complete"
@@ -472,7 +447,9 @@ class VoxscribeDaemon:
 
     def _get_current_text(self) -> str:
         """Get current transcription text."""
-        return " ".join(self.transcripts[k] for k in sorted(self.transcripts)).strip()
+        if self.provider:
+            return self.provider.get_text()
+        return ""
 
     def _write_result_file(self) -> None:
         """Write current transcripts to output file (live updates)."""
@@ -482,58 +459,6 @@ class VoxscribeDaemon:
         if result:
             self.current_output_file.write_text(result)
 
-    def _handle_event(self, ev: dict[str, Any]) -> None:
-        """Handle OpenAI event."""
-        t = ev.get("type", "")
-        item_id = ev.get("item_id", "")
-
-        if t == "input_audio_buffer.speech_started":
-            if item_id:
-                self.pending_items.add(item_id)
-
-        elif t == "conversation.item.input_audio_transcription.delta":
-            delta = ev.get("delta", "")
-            if item_id and delta:
-                self.transcripts[item_id] = self.transcripts.get(item_id, "") + delta
-                self._write_result_file()
-
-        elif t == "conversation.item.input_audio_transcription.completed":
-            transcript = ev.get("transcript", "")
-            if item_id:
-                if transcript:
-                    self.transcripts[item_id] = transcript
-                self.pending_items.discard(item_id)
-                # Calculate and log latency
-                created_at = self.item_creation_times.pop(item_id, None)
-                if created_at:
-                    latency = asyncio.get_event_loop().time() - created_at
-                    logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars ({latency:.1f}s latency)")
-                else:
-                    logger.info(f"Transcription completed [{item_id[:8]}]: {len(transcript)} chars")
-                self._write_result_file()
-                self.emit_state("recording", self._get_current_text()[-500:])
-
-        elif t == "input_audio_buffer.committed":
-            committed_item_id = ev.get("item_id", "")
-            if committed_item_id:
-                self.pending_items.add(committed_item_id)
-                self.item_creation_times[committed_item_id] = asyncio.get_event_loop().time()
-                logger.info(f"Commit created item: {committed_item_id[:8]}")
-
-        elif t == "conversation.item.input_audio_transcription.failed":
-            error = ev.get("error", {})
-            if item_id:
-                self.failed_items.add(item_id)
-                self.pending_items.discard(item_id)
-                self.item_creation_times.pop(item_id, None)
-                logger.error(
-                    f"Transcription failed [{item_id[:8]}]: "
-                    f"{error.get('code', 'unknown')} - {error.get('message', 'No message')}"
-                )
-
-        elif t == "error":
-            logger.error(f"API error: {ev.get('error', {})}")
-
     async def _handle_recording_failure(self) -> None:
         """Handle WebSocket failure during recording - save partial data and notify user."""
         logger.warning("Handling recording failure - saving partial data")
@@ -541,13 +466,9 @@ class VoxscribeDaemon:
         # Stop pw-record
         await self._terminate_pw_record()
 
-        # Close websocket if still open
-        if self.websocket:
-            try:
-                await asyncio.wait_for(self.websocket.close(), timeout=1)
-            except Exception:
-                pass
-            self.websocket = None
+        # Close provider
+        if self.provider:
+            await self.provider.close()
 
         # Save whatever transcripts we have
         result = self._get_current_text()
@@ -565,29 +486,21 @@ class VoxscribeDaemon:
         self.state = State.IDLE
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle"))
 
-    async def _alert_transcription_stall(self, item_id: str, age: float) -> None:
-        """Alert user that transcription is stalled during recording."""
-        logger.warning(f"Transcription stalled for {item_id[:8]} ({age:.1f}s with no completion)")
-        self.play_sound(SOUND_ERROR)
-        self.emit_state("partial", f"Transcription delayed ({age:.0f}s)")
-
     async def _recording_loop(self) -> None:
-        """Main loop for sending audio and receiving events.
+        """Main loop for sending audio and monitoring health.
 
-        Uses asyncio.wait(FIRST_COMPLETED) so we react immediately when
-        either WebSocket task exits, rather than waiting for all tasks.
+        The provider's recv loop runs internally as its own task.
         """
         logger.info("Recording loop started")
-        loop_start = asyncio.get_event_loop().time()
-        websocket_error = False
+        loop_start = time.monotonic()
         exit_reason = "unknown"
 
         async def send_audio() -> None:
-            """Send audio chunks to WebSocket."""
-            nonlocal websocket_error, exit_reason
+            """Read pw-record and send chunks through silence gate to provider."""
+            nonlocal exit_reason
             logger.debug("send_audio task started")
             try:
-                while self.state == State.RECORDING and self.pw_record_proc and self.websocket:
+                while self.state == State.RECORDING and self.pw_record_proc and self.provider:
                     try:
                         assert self.pw_record_proc.stdout is not None
                         chunk = await asyncio.wait_for(
@@ -596,120 +509,90 @@ class VoxscribeDaemon:
                         )
                         if not chunk:
                             break
-                        await self.websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "input_audio_buffer.append",
-                                    "audio": base64.b64encode(chunk).decode(),
-                                }
-                            )
-                        )
+
+                        if self.silence_gate:
+                            action, onset_chunks = self.silence_gate.process(chunk)
+                            if action == SilenceAction.SEND:
+                                for onset_chunk in onset_chunks:
+                                    await self.provider.send_audio(onset_chunk)
+                                await self.provider.send_audio(chunk)
+                            elif action == SilenceAction.KEEPALIVE:
+                                await self.provider.send_audio(chunk)
+                            # SKIP: do nothing
+                        else:
+                            await self.provider.send_audio(chunk)
+
                     except asyncio.TimeoutError:
                         continue
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
                         logger.error(f"Send audio error: {e}")
-                        websocket_error = True
+                        self._websocket_error = True
                         exit_reason = "send_audio_error"
                         break
             finally:
                 logger.debug("send_audio task exiting")
 
-        async def recv_events() -> None:
-            """Receive and handle WebSocket events."""
-            nonlocal websocket_error, exit_reason
-            logger.debug("recv_events task started")
-            try:
-                while self.state == State.RECORDING and self.websocket:
-                    try:
-                        msg = await asyncio.wait_for(self.websocket.recv(), timeout=0.2)
-                        self._handle_event(json.loads(msg))
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        logger.error(f"Recv event error: {e}")
-                        websocket_error = True
-                        exit_reason = "recv_events_error"
-                        break
-            finally:
-                logger.debug("recv_events task exiting")
-
-        async def monitor_transcriptions() -> None:
-            """Monitor pending transcriptions and alert if stalled."""
+        async def monitor() -> None:
+            """Watchdog and heartbeat monitoring."""
             logger.debug("monitor task started")
-            alerted_items: set[str] = set()
             heartbeat_interval = 30
-            last_heartbeat = asyncio.get_event_loop().time()
+            last_heartbeat = time.monotonic()
+            watchdog_timeout = 30.0
             try:
                 while self.state == State.RECORDING:
                     await asyncio.sleep(5)
-
-                    now = asyncio.get_event_loop().time()
+                    now = time.monotonic()
 
                     # Periodic heartbeat
                     if now - last_heartbeat >= heartbeat_interval:
                         duration = now - loop_start
-                        oldest_age = 0.0
-                        if self.item_creation_times:
-                            oldest_age = now - min(self.item_creation_times.values())
                         logger.debug(
-                            f"Recording heartbeat: {duration:.0f}s elapsed, "
-                            f"{len(self.pending_items)} pending, oldest {oldest_age:.0f}s ago"
+                            f"Recording heartbeat: {duration:.0f}s elapsed"
                         )
                         last_heartbeat = now
 
-                    # Check for stalled transcriptions
-                    stall_threshold = self.config.get("stall_alert_threshold", 10)
-                    for item_id, created_at in list(self.item_creation_times.items()):
-                        age = now - created_at
+                    # Watchdog: check provider responsiveness (skip during silence gaps)
+                    if self.provider:
+                        in_silence_gap = self.silence_gate and self.silence_gate.in_gap
+                        if not in_silence_gap:
+                            silence = now - self.provider.last_event_time
+                            if silence > watchdog_timeout:
+                                logger.warning(
+                                    f"No provider events for {silence:.0f}s, possible stall"
+                                )
+                                self.play_sound(SOUND_ERROR)
+                                self.emit_state("partial", "Connection may be stalled")
 
-                        if age > stall_threshold and item_id not in alerted_items:
-                            await self._alert_transcription_stall(item_id, age)
-                            alerted_items.add(item_id)
+                    # Check for provider error
+                    if self._websocket_error:
+                        break
+
             except asyncio.CancelledError:
                 pass
             finally:
                 logger.debug("monitor task exiting")
 
-        # Create tasks explicitly so we can manage them
         send_task = asyncio.create_task(send_audio())
-        recv_task = asyncio.create_task(recv_events())
-        monitor_task = asyncio.create_task(monitor_transcriptions())
+        monitor_task = asyncio.create_task(monitor())
 
         try:
-            # Wait for EITHER send or recv to complete (whichever exits first)
-            # This returns immediately when any websocket task exits
-            done, pending = await asyncio.wait(
-                {send_task, recv_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            logger.debug(f"WebSocket task exited: done={len(done)}, pending={len(pending)}")
+            # Wait for send_audio to exit (recv runs inside provider)
+            await send_task
 
-            # Determine exit reason if not already set by error
             if exit_reason == "unknown":
                 if self.state != State.RECORDING:
                     exit_reason = "user_stopped"
                 else:
                     exit_reason = "task_exited"
 
-            # Cancel the other websocket task if still running
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
         except asyncio.CancelledError:
             exit_reason = "cancelled"
             raise
 
         finally:
-            # Cancel ALL tasks when exiting (handles external cancellation too)
-            for task in [send_task, recv_task, monitor_task]:
+            for task in [send_task, monitor_task]:
                 if not task.done():
                     task.cancel()
                     try:
@@ -717,13 +600,12 @@ class VoxscribeDaemon:
                     except asyncio.CancelledError:
                         pass
 
-            # Log exit summary
-            duration = asyncio.get_event_loop().time() - loop_start
+            duration = time.monotonic() - loop_start
             logger.info(f"Recording loop ended: {exit_reason} ({duration:.1f}s)")
 
-        # If WebSocket error occurred during recording, handle failure
-        if websocket_error and self.state == State.RECORDING:
-            logger.info(f"WebSocket failed during recording, triggering failure handler")
+        # If error occurred during recording, handle failure
+        if self._websocket_error and self.state == State.RECORDING:
+            logger.info("Provider failed during recording, triggering failure handler")
             await self._handle_recording_failure()
 
     async def handle_command(self, cmd: str) -> str:
@@ -781,11 +663,9 @@ class VoxscribeDaemon:
         if self.pw_record_proc:
             self.pw_record_proc.kill()
 
-        if self.websocket:
-            try:
-                await self.websocket.close()
-            except Exception:
-                pass
+        if self.provider:
+            await self.provider.close()
+            self.provider = None
 
         if self.dbus_bus:
             try:

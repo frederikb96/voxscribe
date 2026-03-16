@@ -44,7 +44,7 @@ ExecStart={python_path} -m voxscribe.daemon
 Restart=on-failure
 RestartSec=3
 Environment="XDG_RUNTIME_DIR=%t"
-PassEnvironment=OPENAI_API_KEY
+PassEnvironment=OPENAI_API_KEY ELEVENLABS_API_KEY
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=voxscribe
@@ -61,31 +61,35 @@ def get_default_config() -> str:
 # Logging level: debug, info, warning, error
 log_level: info
 
-# VAD (Voice Activity Detection) settings
-vad:
-  # Type: "server_vad" (volume-based) or "semantic_vad" (AI-based)
-  type: server_vad
+# Transcription provider: openai or elevenlabs
+provider: openai
 
-  # Sensitivity threshold (0.0-1.0, higher = more sensitive)
-  threshold: 0.5
+# Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
+language: ""
 
-  # Audio to include BEFORE speech detected (ms)
-  prefix_padding_ms: 300
+# Max seconds to wait for final transcription after stopping recording
+transcription_timeout: 120
 
-  # Silence duration to detect end of speech (ms)
-  # Lower = faster response, Higher = allows longer pauses
-  silence_duration_ms: 1500
-
-# Transcription settings
-transcription:
-  # Model: gpt-4o-transcribe (smart but edits speech), whisper-1 (literal)
+# OpenAI Realtime Transcription settings
+openai:
   model: gpt-4o-transcribe
-
-  # Prompt to guide transcription behavior (optional)
   prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way."
+  vad_type: server_vad
+  vad_threshold: 0.5
+  vad_prefix_padding_ms: 300
+  vad_silence_duration_ms: 1500
 
-  # Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
-  language: ""
+# ElevenLabs Scribe v2 Realtime settings
+elevenlabs:
+  vad_silence_threshold_secs: 1.5
+  vad_threshold: 0.4
+  enable_logging: false
+
+# Client-side silence gate (only used with elevenlabs provider)
+silence_gate:
+  enabled: false
+  threshold: 0.010
+  gap_seconds: 3.0
 """
 
 
@@ -136,7 +140,7 @@ def setup() -> int:
 
     # Import environment variables for systemd
     subprocess.run(
-        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "OPENAI_API_KEY"],
+        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"],
         capture_output=True,
     )
     print("  Imported Wayland environment")

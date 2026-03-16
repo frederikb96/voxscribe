@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "voxscribe"
-version = "1.0.0"
-description = "Real-time speech-to-text daemon using OpenAI Realtime Transcription API"
+version = "1.1.0"
+description = "Real-time speech-to-text daemon with multi-provider support (OpenAI, ElevenLabs)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "Frederik Berg" }
 ]
-keywords = ["speech-to-text", "stt", "transcription", "openai", "realtime", "voice"]
+keywords = ["speech-to-text", "stt", "transcription", "openai", "elevenlabs", "realtime", "voice"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
