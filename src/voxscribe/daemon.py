@@ -39,6 +39,8 @@ SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 CONFIG_FILE = Path.home() / ".config" / "voxscribe" / "config.yaml"
 OUTPUT_DIR = Path("/tmp")
 RESULT_SYMLINK = OUTPUT_DIR / "voxscribe-result.txt"
+RECORDINGS_DIR = OUTPUT_DIR / "voxscribe-recordings"
+MAX_RECORDINGS = 10
 
 # Sound files
 SOUND_START = Path("/usr/share/sounds/freedesktop/stereo/device-added.oga")
@@ -177,6 +179,8 @@ class VoxscribeDaemon:
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
         self._websocket_error: bool = False
+        self.recording_pcm_file: Optional[Path] = None
+        self.recording_pcm_fd: Optional[Any] = None
 
     async def setup_dbus(self) -> None:
         """Set up DBus service for GNOME extension communication."""
@@ -295,6 +299,14 @@ class VoxscribeDaemon:
         RESULT_SYMLINK.unlink(missing_ok=True)
         RESULT_SYMLINK.symlink_to(self.current_output_file)
         logger.info(f"Output file: {self.current_output_file.name}")
+
+        # Create PCM recording file for backup
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        self._cleanup_old_recordings()
+        pcm_name = f"rec-{timestamp}.pcm"
+        self.recording_pcm_file = RECORDINGS_DIR / pcm_name
+        self.recording_pcm_fd = open(self.recording_pcm_file, "wb")
+        logger.info(f"PCM recording: {pcm_name}")
 
         # Create provider
         try:
@@ -417,6 +429,8 @@ class VoxscribeDaemon:
         if self.provider:
             await self.provider.close()
 
+        self._close_pcm_fd()
+
         # Process result
         result = self._get_current_text()
         logger.info(f"Final transcription: {len(result)} chars")
@@ -459,9 +473,31 @@ class VoxscribeDaemon:
         if result:
             self.current_output_file.write_text(result)
 
+    def _cleanup_old_recordings(self) -> None:
+        """Keep only the last MAX_RECORDINGS PCM files."""
+        if not RECORDINGS_DIR.exists():
+            return
+        files = sorted(RECORDINGS_DIR.glob("rec-*.pcm"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for f in files[MAX_RECORDINGS - 1:]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    def _close_pcm_fd(self) -> None:
+        """Close the PCM recording file descriptor."""
+        if self.recording_pcm_fd:
+            try:
+                self.recording_pcm_fd.close()
+            except Exception:
+                pass
+            self.recording_pcm_fd = None
+
     async def _handle_recording_failure(self) -> None:
         """Handle WebSocket failure during recording - save partial data and notify user."""
         logger.warning("Handling recording failure - saving partial data")
+
+        self._close_pcm_fd()
 
         # Stop pw-record
         await self._terminate_pw_record()
@@ -510,6 +546,13 @@ class VoxscribeDaemon:
                         if not chunk:
                             break
 
+                        # Always save to PCM file (before silence gate)
+                        if self.recording_pcm_fd:
+                            try:
+                                self.recording_pcm_fd.write(chunk)
+                            except Exception:
+                                pass
+
                         if self.silence_gate:
                             action, onset_chunks = self.silence_gate.process(chunk)
                             if action == SilenceAction.SEND:
@@ -535,40 +578,22 @@ class VoxscribeDaemon:
                 logger.debug("send_audio task exiting")
 
         async def monitor() -> None:
-            """Watchdog and heartbeat monitoring."""
+            """Heartbeat monitoring."""
             logger.debug("monitor task started")
             heartbeat_interval = 30
             last_heartbeat = time.monotonic()
-            watchdog_timeout = 30.0
             try:
                 while self.state == State.RECORDING:
                     await asyncio.sleep(5)
                     now = time.monotonic()
 
-                    # Periodic heartbeat
                     if now - last_heartbeat >= heartbeat_interval:
                         duration = now - loop_start
-                        logger.debug(
-                            f"Recording heartbeat: {duration:.0f}s elapsed"
-                        )
+                        logger.debug(f"Recording heartbeat: {duration:.0f}s elapsed")
                         last_heartbeat = now
 
-                    # Watchdog: check provider responsiveness (skip during silence gaps)
-                    if self.provider:
-                        in_silence_gap = self.silence_gate and self.silence_gate.in_gap
-                        if not in_silence_gap:
-                            silence = now - self.provider.last_event_time
-                            if silence > watchdog_timeout:
-                                logger.warning(
-                                    f"No provider events for {silence:.0f}s, possible stall"
-                                )
-                                self.play_sound(SOUND_ERROR)
-                                self.emit_state("partial", "Connection may be stalled")
-
-                    # Check for provider error
                     if self._websocket_error:
                         break
-
             except asyncio.CancelledError:
                 pass
             finally:
@@ -659,6 +684,8 @@ class VoxscribeDaemon:
 
         if self.state != State.IDLE:
             await self.stop_recording()
+
+        self._close_pcm_fd()
 
         if self.pw_record_proc:
             self.pw_record_proc.kill()

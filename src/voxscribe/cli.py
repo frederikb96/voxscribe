@@ -10,6 +10,7 @@ Usage:
     voxscribe stop              Stop recording
     voxscribe toggle            Toggle recording (default)
     voxscribe status            Check daemon status
+    voxscribe transcribe <file> Transcribe a PCM recording via batch API
 """
 
 import os
@@ -19,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
+
+import yaml
 
 # Paths
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voxscribe.sock"
@@ -294,6 +297,133 @@ def send_command(cmd: str) -> str:
         return f"ERROR: {e}"
 
 
+def _create_wav(pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, bits: int = 16) -> bytes:
+    """Wrap raw PCM data in a WAV header."""
+    import struct
+
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        len(pcm_data) + 36,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM format
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits,
+        b"data",
+        len(pcm_data),
+    )
+    return header + pcm_data
+
+
+def transcribe_file(file_path: str) -> int:
+    """Transcribe a PCM audio file using batch API."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    pcm_path = Path(file_path)
+    if not pcm_path.exists():
+        print(f"ERROR: File not found: {pcm_path}")
+        return 1
+
+    # Load config
+    if not CONFIG_FILE.exists():
+        print(f"ERROR: Config not found: {CONFIG_FILE}")
+        return 1
+    with open(CONFIG_FILE) as f:
+        config = yaml.safe_load(f)
+
+    provider = config.get("provider", "openai")
+    language = config.get("language", "")
+
+    # Get API key
+    env_var = "OPENAI_API_KEY" if provider == "openai" else "ELEVENLABS_API_KEY"
+    api_key = os.environ.get(env_var, "")
+    if not api_key:
+        print(f"ERROR: {env_var} not set")
+        return 1
+
+    # Read PCM and wrap in WAV
+    pcm_data = pcm_path.read_bytes()
+    if not pcm_data:
+        print("ERROR: Empty file")
+        return 1
+
+    wav_data = _create_wav(pcm_data)
+    print(f"Transcribing {len(pcm_data)} bytes ({len(pcm_data) / 48000:.1f}s of audio)...")
+
+    # Build multipart request
+    boundary = "----VoxscribeBatch"
+    body = b""
+
+    if provider == "elevenlabs":
+        url = "https://api.elevenlabs.io/v1/speech-to-text"
+        headers: dict[str, str] = {"xi-api-key": api_key}
+        fields = {"model_id": "scribe_v2"}
+        if language:
+            fields["language_code"] = language
+    else:
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        fields = {"model": "gpt-4o-transcribe"}
+        if language:
+            fields["language"] = language
+        openai_config = config.get("openai", {})
+        if openai_config.get("prompt"):
+            fields["prompt"] = openai_config["prompt"]
+
+    for key, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="file"; filename="recording.wav"\r\n'
+    body += b"Content-Type: audio/wav\r\n\r\n"
+    body += wav_data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        response = urllib.request.urlopen(req, timeout=120)
+        result = json.loads(response.read().decode())
+        text = result.get("text", "")
+        if text:
+            print(f"\n{text}")
+            # Copy to clipboard
+            try:
+                subprocess.Popen(
+                    ["wl-copy", "--", f"stt-rec: {text}"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                print(f"\nCopied {len(text)} chars to clipboard")
+            except Exception:
+                pass
+            return 0
+        else:
+            print("ERROR: Empty transcription result")
+            return 1
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        print(f"ERROR: HTTP {e.code}: {error_body}")
+        return 1
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
 def main() -> NoReturn:
     """Entry point."""
     cmd = sys.argv[1] if len(sys.argv) > 1 else "toggle"
@@ -306,6 +436,11 @@ def main() -> NoReturn:
         sys.exit(teardown())
     elif cmd == "install-extension":
         sys.exit(install_extension())
+    elif cmd == "transcribe":
+        if len(sys.argv) < 3:
+            print("Usage: voxscribe transcribe <pcm-file>")
+            sys.exit(1)
+        sys.exit(transcribe_file(sys.argv[2]))
 
     # Daemon commands
     if cmd not in ("start", "stop", "status", "toggle"):
