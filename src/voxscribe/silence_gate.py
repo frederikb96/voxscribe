@@ -1,8 +1,8 @@
 """
 Client-side silence detection for Voxscribe.
 
-Filters audio chunks to avoid sending pure silence, reducing bandwidth and
-improving transcription quality with providers that benefit from it.
+Filters audio chunks to avoid sending pure silence, reducing costs
+with providers that charge for all streamed audio (e.g., ElevenLabs).
 """
 
 import logging
@@ -37,7 +37,14 @@ def _rms(chunk: bytes) -> float:
 
 
 class SilenceGate:
-    """Client-side silence gate with EMA smoothing and onset buffering."""
+    """Client-side silence gate with EMA smoothing and onset buffering.
+
+    Flow:
+    - NORMAL: all chunks sent. RMS drops below threshold → start counting.
+    - After gap_seconds of continuous silence → GAP mode (stop sending).
+    - In GAP: send keepalive every 15s. When speech confirmed (3 consecutive
+      above-threshold chunks) → back to NORMAL, flush onset buffer.
+    """
 
     def __init__(self, config: dict[str, Any]) -> None:
         gate_config = config.get("silence_gate", {})
@@ -46,23 +53,24 @@ class SilenceGate:
         self.gap_seconds = gate_config.get("gap_seconds", 3.0)
 
         self._ema: float = 0.0
-        self._in_gap: bool = True
-        self._gap_start: float = time.monotonic()
-        self._last_keepalive: float = time.monotonic()
+        self._in_gap: bool = False
+        self._silence_start: float = 0.0
+        self._last_keepalive: float = 0.0
         self._speech_count: int = 0
         self._onset_buffer: list[bytes] = []
+
+        if self.enabled:
+            logger.info(
+                f"Silence gate enabled: threshold={self.threshold:.4f}, "
+                f"gap={self.gap_seconds:.1f}s"
+            )
 
     @property
     def in_gap(self) -> bool:
         return self._in_gap
 
     def process(self, chunk: bytes) -> tuple[SilenceAction, list[bytes]]:
-        """Process a chunk, return action and any onset chunks to flush.
-
-        Returns:
-            (action, onset_chunks): action is SEND/SKIP/KEEPALIVE,
-            onset_chunks is non-empty only on speech onset confirmation.
-        """
+        """Process a chunk, return action and any onset chunks to flush."""
         if not self.enabled:
             return SilenceAction.SEND, []
 
@@ -72,39 +80,45 @@ class SilenceGate:
         is_loud = self._ema > self.threshold
 
         if is_loud:
+            self._silence_start = 0.0
+
             if self._in_gap:
-                # Potential speech onset
                 self._speech_count += 1
                 self._onset_buffer.append(chunk)
 
                 if self._speech_count >= SPEECH_CONFIRM_CHUNKS:
-                    # Confirmed speech: flush onset buffer
                     self._in_gap = False
                     onset_chunks = list(self._onset_buffer)
                     self._onset_buffer.clear()
                     self._speech_count = 0
-                    logger.debug("Silence gate: speech onset confirmed")
+                    logger.info(
+                        f"Silence gate OPEN — speech resumed "
+                        f"(rms={self._ema:.4f}, flushing {len(onset_chunks)} chunks)"
+                    )
                     return SilenceAction.SEND, onset_chunks
                 else:
                     return SilenceAction.SKIP, []
             else:
-                # Already in speech
                 return SilenceAction.SEND, []
         else:
-            # Below threshold
             self._speech_count = 0
             self._onset_buffer.clear()
 
-            if not self._in_gap:
-                # Transition to gap
-                self._in_gap = True
-                self._gap_start = now
-                self._last_keepalive = now
-                logger.debug("Silence gate: entering gap")
-
-            # Check keepalive
-            if now - self._last_keepalive >= KEEPALIVE_INTERVAL:
-                self._last_keepalive = now
-                return SilenceAction.KEEPALIVE, []
-
-            return SilenceAction.SKIP, []
+            if self._in_gap:
+                if now - self._last_keepalive >= KEEPALIVE_INTERVAL:
+                    self._last_keepalive = now
+                    return SilenceAction.KEEPALIVE, []
+                return SilenceAction.SKIP, []
+            else:
+                if self._silence_start == 0.0:
+                    self._silence_start = now
+                elapsed = now - self._silence_start
+                if elapsed >= self.gap_seconds:
+                    self._in_gap = True
+                    self._last_keepalive = now
+                    logger.info(
+                        f"Silence gate CLOSED — silence for {elapsed:.1f}s "
+                        f"(rms={self._ema:.4f}, threshold={self.threshold:.4f})"
+                    )
+                    return SilenceAction.SKIP, []
+                return SilenceAction.SEND, []
