@@ -15,7 +15,7 @@ logger = logging.getLogger("voxscribe")
 
 SAMPLE_RATE = 24000
 CHUNK_BYTES = 4800  # 100ms at 24kHz 16-bit mono
-KEEPALIVE_INTERVAL = 15.0
+KEEPALIVE_INTERVAL = 10.0
 SPEECH_CONFIRM_CHUNKS = 3
 EMA_ALPHA = 0.3
 
@@ -120,5 +120,5 @@ class SilenceGate:
                         f"Silence gate CLOSED — silence for {elapsed:.1f}s "
                         f"(rms={self._ema:.4f}, threshold={self.threshold:.4f})"
                     )
-                    return SilenceAction.SKIP, []
+                    return SilenceAction.KEEPALIVE, []
                 return SilenceAction.SEND, []
