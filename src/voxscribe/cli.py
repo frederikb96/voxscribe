@@ -342,6 +342,8 @@ def transcribe_file(file_path: str) -> int:
 
     provider = config.get("provider", "openai")
     language = config.get("language", "")
+    if language == "auto":
+        language = ""
 
     # Get API key
     env_var = "OPENAI_API_KEY" if provider == "openai" else "ELEVENLABS_API_KEY"

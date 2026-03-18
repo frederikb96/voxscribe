@@ -289,8 +289,8 @@ class ElevenLabsProvider(TranscriptionProvider):
         if "enable_logging" in el:
             params.append(f"enable_logging={'true' if el['enable_logging'] else 'false'}")
 
-        language = self._config.get("language")
-        if language:
+        language = self._config.get("language", "")
+        if language and language != "auto":
             params.append(f"language_code={language}")
 
         url = f"wss://api.elevenlabs.io/v1/speech-to-text/realtime?{'&'.join(params)}"
