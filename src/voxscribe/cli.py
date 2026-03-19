@@ -10,7 +10,7 @@ Usage:
     voxscribe stop              Stop recording
     voxscribe toggle            Toggle recording (default)
     voxscribe status            Check daemon status
-    voxscribe transcribe <file> Transcribe a PCM recording via batch API
+    voxscribe transcribe [file]  Transcribe a PCM recording (default: latest)
 """
 
 import os
@@ -439,10 +439,20 @@ def main() -> NoReturn:
     elif cmd == "install-extension":
         sys.exit(install_extension())
     elif cmd == "transcribe":
-        if len(sys.argv) < 3:
-            print("Usage: voxscribe transcribe <pcm-file>")
-            sys.exit(1)
-        sys.exit(transcribe_file(sys.argv[2]))
+        arg = sys.argv[2] if len(sys.argv) >= 3 else "latest"
+        if arg == "latest":
+            recordings_dir = Path("/tmp/voxscribe-recordings")
+            if not recordings_dir.exists():
+                print("ERROR: No recordings directory found")
+                sys.exit(1)
+            pcm_files = sorted(recordings_dir.glob("rec-*.pcm"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not pcm_files:
+                print("ERROR: No recordings found")
+                sys.exit(1)
+            print(f"Using latest recording: {pcm_files[0].name}")
+            sys.exit(transcribe_file(str(pcm_files[0])))
+        else:
+            sys.exit(transcribe_file(arg))
 
     # Daemon commands
     if cmd not in ("start", "stop", "status", "toggle"):
