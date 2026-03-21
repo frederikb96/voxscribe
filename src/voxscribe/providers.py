@@ -339,6 +339,7 @@ class ElevenLabsProvider(TranscriptionProvider):
                 except websockets.ConnectionClosed as e:
                     self.close_code = e.code
                     self.close_reason = e.reason or ""
+                    self._pending_commit = False
                     logger.warning(f"WebSocket closed during recv: {e.code} {self.close_reason}")
                     if self.on_error:
                         self.on_error("WebSocket connection closed")
