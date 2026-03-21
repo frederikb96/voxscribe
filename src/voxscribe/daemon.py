@@ -179,6 +179,11 @@ class VoxscribeDaemon:
         self.dbus_interface: Optional[Any] = None
         self.dbus_bus: Optional[Any] = None
         self._websocket_error: bool = False
+        self._reconnecting: bool = False
+        self._reconnect_task: Optional[asyncio.Task[None]] = None
+        self._reconnect_count: int = 0
+        self._preserved_transcripts: list[str] = []
+        self._pcm_bytes_written: int = 0
         self.recording_pcm_file: Optional[Path] = None
         self.recording_pcm_fd: Optional[Any] = None
 
@@ -291,6 +296,11 @@ class VoxscribeDaemon:
         self.emit_state("recording", "")
         logger.info("Starting recording session")
         self._websocket_error = False
+        self._reconnecting = False
+        self._reconnect_task = None
+        self._reconnect_count = 0
+        self._preserved_transcripts.clear()
+        self._pcm_bytes_written = 0
 
         # Create timestamped output file and update symlink
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -385,7 +395,17 @@ class VoxscribeDaemon:
         self.state = State.TRANSCRIBING
         self.emit_state("transcribing", self._get_current_text()[-500:])
 
-        # Cancel recording task first
+        # Cancel reconnect task if running
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+            self._reconnecting = False
+
+        # Cancel recording task
         if self.recording_task and not self.recording_task.done():
             self.recording_task.cancel()
             try:
@@ -460,10 +480,13 @@ class VoxscribeDaemon:
         return True, f"Transcription {status}: {len(result)} chars"
 
     def _get_current_text(self) -> str:
-        """Get current transcription text."""
+        """Get current transcription text including preserved transcripts from reconnections."""
+        parts = list(self._preserved_transcripts)
         if self.provider:
-            return self.provider.get_text()
-        return ""
+            provider_text = self.provider.get_text()
+            if provider_text:
+                parts.append(provider_text)
+        return " ".join(parts).strip() if parts else ""
 
     def _write_result_file(self) -> None:
         """Write current transcripts to output file (live updates)."""
@@ -522,6 +545,102 @@ class VoxscribeDaemon:
         self.state = State.IDLE
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle"))
 
+    async def _reconnect_provider(self, disconnect_pcm_offset: int) -> None:
+        """Reconnect to ElevenLabs after resource_exhausted, replay gap audio."""
+        from voxscribe.providers import ElevenLabsProvider
+
+        backoff_times = [5, 10, 20]
+
+        # Save transcripts from old provider before closing
+        if self.provider:
+            old_text = self.provider.get_text()
+            if old_text:
+                self._preserved_transcripts.append(old_text)
+            await self.provider.close()
+            self.provider = None
+
+        for attempt in range(3):
+            try:
+                cooldown = backoff_times[attempt]
+                logger.info(f"Reconnect attempt {attempt + 1}/3, waiting {cooldown}s...")
+
+                # Interruptible cooldown (check for user stop every 100ms)
+                for _ in range(cooldown * 10):
+                    if self.state != State.RECORDING:
+                        logger.info("Recording stopped during reconnect cooldown")
+                        self._reconnecting = False
+                        return
+                    await asyncio.sleep(0.1)
+
+                new_provider = ElevenLabsProvider(self.api_key, self.config)
+
+                # Pass last transcript segment for language/context continuity
+                full_text = self._get_current_text()
+                if full_text:
+                    new_provider.set_previous_text(full_text)
+
+                new_provider.on_ready = lambda: logger.info("Provider ready (reconnected)")
+                new_provider.on_text_update = self._on_text_update
+                new_provider.on_error = self._on_provider_error
+
+                await new_provider.connect()
+                self.provider = new_provider
+                self._websocket_error = False
+
+                # Replay gap audio from PCM file
+                await self._replay_pcm_gap(disconnect_pcm_offset)
+
+                logger.info("Reconnection successful, resuming live audio")
+                self._reconnecting = False
+                return
+
+            except asyncio.CancelledError:
+                logger.info("Reconnection cancelled")
+                self._reconnecting = False
+                raise
+            except Exception as e:
+                logger.error(f"Reconnect attempt {attempt + 1} failed: {e}")
+                if self.provider:
+                    try:
+                        await self.provider.close()
+                    except Exception:
+                        pass
+                    self.provider = None
+
+        logger.error("All reconnect attempts failed")
+        self._reconnecting = False
+        self._websocket_error = True
+        await self._handle_recording_failure()
+
+    async def _replay_pcm_gap(self, from_offset: int) -> None:
+        """Replay audio from PCM file starting at given offset to current position."""
+        if not self.recording_pcm_file or not self.provider:
+            return
+
+        gap_bytes = self._pcm_bytes_written - from_offset
+        if gap_bytes <= 0:
+            logger.info("No gap audio to replay")
+            return
+
+        gap_seconds = gap_bytes / (SAMPLE_RATE * 2)
+        logger.info(f"Replaying {gap_seconds:.1f}s of gap audio")
+
+        try:
+            with open(self.recording_pcm_file, "rb") as f:
+                f.seek(from_offset)
+                replayed = 0
+                while replayed < gap_bytes:
+                    remaining = gap_bytes - replayed
+                    read_size = min(CHUNK_BYTES, remaining)
+                    chunk = f.read(read_size)
+                    if not chunk:
+                        break
+                    await self.provider.send_audio(chunk)
+                    replayed += len(chunk)
+            logger.info(f"Gap replay complete: {replayed} bytes")
+        except Exception as e:
+            logger.error(f"Gap replay error: {e}")
+
     async def _recording_loop(self) -> None:
         """Main loop for sending audio and monitoring health.
 
@@ -536,7 +655,7 @@ class VoxscribeDaemon:
             nonlocal exit_reason
             logger.debug("send_audio task started")
             try:
-                while self.state == State.RECORDING and self.pw_record_proc and self.provider:
+                while self.state == State.RECORDING and self.pw_record_proc:
                     try:
                         assert self.pw_record_proc.stdout is not None
                         chunk = await asyncio.wait_for(
@@ -550,8 +669,13 @@ class VoxscribeDaemon:
                         if self.recording_pcm_fd:
                             try:
                                 self.recording_pcm_fd.write(chunk)
+                                self._pcm_bytes_written += len(chunk)
                             except Exception:
                                 pass
+
+                        # Skip WebSocket sends during reconnection (audio is in PCM)
+                        if self._reconnecting or not self.provider:
+                            continue
 
                         if self.silence_gate:
                             action, onset_chunks = self.silence_gate.process(chunk)
@@ -570,7 +694,27 @@ class VoxscribeDaemon:
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
+                        error_str = str(e)
                         logger.error(f"Send audio error: {e}")
+
+                        if "resource_exhausted" in error_str and not self._reconnecting:
+                            if self._reconnect_count >= 5:
+                                logger.error("Too many reconnections this session")
+                                self._websocket_error = True
+                                exit_reason = "send_audio_error"
+                                break
+                            self._reconnect_count += 1
+                            self._reconnecting = True
+                            disconnect_offset = self._pcm_bytes_written
+                            logger.info(
+                                f"Resource exhausted (reconnect {self._reconnect_count}/5), "
+                                f"PCM offset {disconnect_offset}"
+                            )
+                            self._reconnect_task = asyncio.create_task(
+                                self._reconnect_provider(disconnect_offset)
+                            )
+                            continue
+
                         self._websocket_error = True
                         exit_reason = "send_audio_error"
                         break
@@ -625,10 +769,18 @@ class VoxscribeDaemon:
                     except asyncio.CancelledError:
                         pass
 
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
+                try:
+                    await self._reconnect_task
+                except asyncio.CancelledError:
+                    pass
+                self._reconnect_task = None
+
             duration = time.monotonic() - loop_start
             logger.info(f"Recording loop ended: {exit_reason} ({duration:.1f}s)")
 
-        # If error occurred during recording, handle failure
+        # If error occurred during recording (and not handled by reconnect), handle failure
         if self._websocket_error and self.state == State.RECORDING:
             logger.info("Provider failed during recording, triggering failure handler")
             await self._handle_recording_failure()

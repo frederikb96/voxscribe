@@ -272,7 +272,11 @@ class ElevenLabsProvider(TranscriptionProvider):
         self._config = config
         self.committed_segments: list[str] = []
         self.current_partial: str = ""
-        self.has_uncommitted_partial: bool = False
+        self._pending_commit: bool = False
+        self.close_code: Optional[int] = None
+        self.close_reason: str = ""
+        self._previous_text: str = ""
+        self._first_chunk_sent: bool = False
 
     async def connect(self) -> None:
         el = self._config.get("elevenlabs", {})
@@ -310,6 +314,7 @@ class ElevenLabsProvider(TranscriptionProvider):
         else:
             logger.warning(f"Expected session_started, got: {ev.get('message_type')}")
         self.last_event_time = time.monotonic()
+        self._first_chunk_sent = False
 
         # Start recv task
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -331,8 +336,10 @@ class ElevenLabsProvider(TranscriptionProvider):
                     continue
                 except asyncio.CancelledError:
                     raise
-                except websockets.ConnectionClosed:
-                    logger.warning("WebSocket closed during recv")
+                except websockets.ConnectionClosed as e:
+                    self.close_code = e.code
+                    self.close_reason = e.reason or ""
+                    logger.warning(f"WebSocket closed during recv: {e.code} {self.close_reason}")
                     if self.on_error:
                         self.on_error("WebSocket connection closed")
                     break
@@ -349,7 +356,6 @@ class ElevenLabsProvider(TranscriptionProvider):
 
         if mt == "partial_transcript":
             self.current_partial = ev.get("text", "")
-            self.has_uncommitted_partial = bool(self.current_partial)
             if self.on_text_update:
                 self.on_text_update(self.get_text())
 
@@ -359,7 +365,7 @@ class ElevenLabsProvider(TranscriptionProvider):
                 self.committed_segments.append(text)
                 logger.info(f"Committed transcript: {len(text)} chars")
             self.current_partial = ""
-            self.has_uncommitted_partial = False
+            self._pending_commit = False
             if self.on_text_update:
                 self.on_text_update(self.get_text())
 
@@ -382,18 +388,22 @@ class ElevenLabsProvider(TranscriptionProvider):
             else:
                 logger.debug(f"Unhandled ElevenLabs event: {mt}")
 
+    def set_previous_text(self, text: str) -> None:
+        """Set context text for the first audio chunk (max 50 chars per ElevenLabs docs)."""
+        self._previous_text = text[-50:] if text else ""
+
     async def send_audio(self, chunk: bytes) -> None:
         if self._ws:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "message_type": "input_audio_chunk",
-                        "audio_base_64": base64.b64encode(chunk).decode(),
-                        "commit": False,
-                        "sample_rate": SAMPLE_RATE,
-                    }
-                )
-            )
+            msg: dict[str, Any] = {
+                "message_type": "input_audio_chunk",
+                "audio_base_64": base64.b64encode(chunk).decode(),
+                "commit": False,
+                "sample_rate": SAMPLE_RATE,
+            }
+            if not self._first_chunk_sent and self._previous_text:
+                msg["previous_text"] = self._previous_text
+            self._first_chunk_sent = True
+            await self._ws.send(json.dumps(msg))
 
     async def commit(self) -> None:
         """Send a short silent chunk with commit=true to force flush."""
@@ -411,6 +421,7 @@ class ElevenLabsProvider(TranscriptionProvider):
                         }
                     )
                 )
+                self._pending_commit = True
                 logger.info("Sent commit with silent chunk")
             except Exception as e:
                 logger.error(f"Failed to send commit: {e}")
@@ -422,12 +433,15 @@ class ElevenLabsProvider(TranscriptionProvider):
         return " ".join(parts).strip()
 
     def has_pending(self) -> bool:
-        return self.has_uncommitted_partial
+        return self._pending_commit
 
     def reset(self) -> None:
         self.committed_segments.clear()
         self.current_partial = ""
-        self.has_uncommitted_partial = False
+        self._pending_commit = False
+        self.close_code = None
+        self.close_reason = ""
+        self._first_chunk_sent = False
 
 
 def create_provider(config: dict[str, Any], api_key: str) -> TranscriptionProvider:
