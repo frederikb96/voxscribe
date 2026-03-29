@@ -260,11 +260,10 @@ class VoxscribeDaemon:
 
         try:
             subprocess.Popen(
-                ["wl-copy", "--", text],
+                ["systemd-run", "--user", "--no-block", "--", "wl-copy", "--", text],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
             )
             logger.info(f"Copied {len(text)} chars to clipboard")
             return True
@@ -697,7 +696,8 @@ class VoxscribeDaemon:
                         error_str = str(e)
                         logger.error(f"Send audio error: {e}")
 
-                        if "resource_exhausted" in error_str and not self._reconnecting:
+                        server_close = "received 1000" in error_str and not self._reconnecting
+                        if server_close:
                             if self._reconnect_count >= 5:
                                 logger.error("Too many reconnections this session")
                                 self._websocket_error = True
@@ -707,7 +707,7 @@ class VoxscribeDaemon:
                             self._reconnecting = True
                             disconnect_offset = self._pcm_bytes_written
                             logger.info(
-                                f"Resource exhausted (reconnect {self._reconnect_count}/5), "
+                                f"Server closed connection (reconnect {self._reconnect_count}/5), "
                                 f"PCM offset {disconnect_offset}"
                             )
                             self._reconnect_task = asyncio.create_task(
