@@ -255,20 +255,21 @@ class VoxscribeDaemon:
                 logger.debug(f"Sound play failed: {e}")
 
     def copy_to_clipboard(self, text: str) -> bool:
-        """Copy text to clipboard using wl-copy."""
+        """Copy text to clipboard using xsel (XWayland)."""
         import subprocess
 
         try:
-            subprocess.Popen(
-                ["systemd-run", "--user", "--no-block", "--", "wl-copy", "--", text],
-                stdin=subprocess.DEVNULL,
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=text.encode(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=5,
             )
             logger.info(f"Copied {len(text)} chars to clipboard")
             return True
         except FileNotFoundError:
-            logger.error("wl-copy not found")
+            logger.error("xsel not found")
             return False
         except Exception as e:
             logger.error(f"Clipboard copy failed: {e}")

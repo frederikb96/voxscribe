@@ -403,12 +403,12 @@ def transcribe_file(file_path: str) -> int:
             print(f"\n{text}")
             # Copy to clipboard
             try:
-                subprocess.Popen(
-                    ["wl-copy", "--", f"stt-rec: {text}"],
-                    stdin=subprocess.DEVNULL,
+                subprocess.run(
+                    ["xsel", "--clipboard", "--input"],
+                    input=f"stt-rec: {text}".encode(),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+                    timeout=5,
                 )
                 print(f"\nCopied {len(text)} chars to clipboard")
             except Exception:
