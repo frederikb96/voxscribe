@@ -44,7 +44,7 @@ BindsTo=graphical-session.target
 [Service]
 Type=simple
 ExecStart={python_path} -m voxscribe.daemon
-Restart=on-failure
+Restart=always
 RestartSec=3
 Environment="XDG_RUNTIME_DIR=%t"
 PassEnvironment=OPENAI_API_KEY ELEVENLABS_API_KEY
@@ -53,7 +53,7 @@ StandardError=journal
 SyslogIdentifier=voxscribe
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 """
 
 
