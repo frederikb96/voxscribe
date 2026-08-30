@@ -23,6 +23,8 @@ from typing import NoReturn
 
 import yaml
 
+from voxscribe.paths import RECORDINGS_DIR
+
 # Paths
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voxscribe.sock"
 CONFIG_DIR = Path.home() / ".config" / "voxscribe"
@@ -441,11 +443,10 @@ def main() -> NoReturn:
     elif cmd == "transcribe":
         arg = sys.argv[2] if len(sys.argv) >= 3 else "latest"
         if arg == "latest":
-            recordings_dir = Path("/tmp/voxscribe-recordings")
-            if not recordings_dir.exists():
+            if not RECORDINGS_DIR.exists():
                 print("ERROR: No recordings directory found")
                 sys.exit(1)
-            pcm_files = sorted(recordings_dir.glob("rec-*.pcm"), key=lambda f: f.stat().st_mtime, reverse=True)
+            pcm_files = sorted(RECORDINGS_DIR.glob("rec-*.pcm"), key=lambda f: f.stat().st_mtime, reverse=True)
             if not pcm_files:
                 print("ERROR: No recordings found")
                 sys.exit(1)

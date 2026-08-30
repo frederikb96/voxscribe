@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 import yaml
 
+from voxscribe.paths import OUTPUT_DIR, RECORDINGS_DIR, RESULT_SYMLINK, ensure_output_dir
 from voxscribe.providers import TranscriptionProvider, create_provider
 from voxscribe.silence_gate import SilenceAction, SilenceGate
 
@@ -37,9 +38,6 @@ SAMPLE_RATE = 24000
 CHUNK_BYTES = 4800  # 100ms of audio at 24kHz 16-bit mono
 SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voxscribe.sock"
 CONFIG_FILE = Path.home() / ".config" / "voxscribe" / "config.yaml"
-OUTPUT_DIR = Path("/tmp")
-RESULT_SYMLINK = OUTPUT_DIR / "voxscribe-result.txt"
-RECORDINGS_DIR = OUTPUT_DIR / "voxscribe-recordings"
 MAX_RECORDINGS = 10
 
 # Sound files
@@ -303,6 +301,7 @@ class VoxscribeDaemon:
         self._pcm_bytes_written = 0
 
         # Create timestamped output file and update symlink
+        ensure_output_dir()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.current_output_file = OUTPUT_DIR / f"voxscribe-{timestamp}.txt"
         self.current_output_file.touch()

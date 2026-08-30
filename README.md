@@ -33,8 +33,8 @@ voxscribe stop      # Stop recording
 
 **Output:**
 - Clipboard: `stt-rec: <transcription>`
-- File: `/tmp/voxscribe-YYYYMMDD-HHMMSS.txt`
-- Live preview: `tail -f /tmp/voxscribe-result.txt`
+- File: `~/.tmp/voxscribe-YYYYMMDD-HHMMSS.txt`
+- Live preview: `tail -f ~/.tmp/voxscribe-result.txt`
 
 ## GNOME Extension (Optional)
 
