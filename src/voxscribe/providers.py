@@ -18,6 +18,23 @@ logger = logging.getLogger("voxscribe")
 
 SAMPLE_RATE = 24000
 
+# Shortest repeated stretch treated as a duplicate; shorter repeats are normal speech.
+MIN_OVERLAP = 30
+
+
+def strip_overlap(existing: str, incoming: str) -> str:
+    """Drop the leading part of incoming that repeats the tail of existing.
+
+    A forced commit can re-emit audio that a VAD commit already transcribed, which lands as a
+    segment repeating the end of the text so far. Returns "" when incoming is entirely a repeat.
+    """
+    tail = existing.rstrip()
+    head = incoming.strip()
+    for n in range(min(len(tail), len(head)), MIN_OVERLAP - 1, -1):
+        if tail.endswith(head[:n]):
+            return head[n:].lstrip()
+    return incoming
+
 
 class TranscriptionProvider(ABC):
     """Base class for streaming transcription providers."""
@@ -363,8 +380,12 @@ class ElevenLabsProvider(TranscriptionProvider):
         elif mt in ("committed_transcript", "committed_transcript_with_timestamps"):
             text = ev.get("text", "")
             if text:
-                self.committed_segments.append(text)
-                logger.info(f"Committed transcript: {len(text)} chars")
+                kept = strip_overlap(" ".join(self.committed_segments), text)
+                if len(kept) < len(text):
+                    logger.info(f"Dropped {len(text) - len(kept)} duplicated chars from commit")
+                if kept:
+                    self.committed_segments.append(kept)
+                    logger.info(f"Committed transcript: {len(kept)} chars")
             self.current_partial = ""
             self._pending_commit = False
             if self.on_text_update:

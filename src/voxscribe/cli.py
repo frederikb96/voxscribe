@@ -13,6 +13,7 @@ Usage:
     voxscribe transcribe [file]  Transcribe a PCM recording (default: latest)
 """
 
+import asyncio
 import os
 import shutil
 import socket
@@ -23,6 +24,7 @@ from typing import NoReturn
 
 import yaml
 
+from voxscribe.clipboard import clipboard_payload, copy_text
 from voxscribe.paths import RECORDINGS_DIR
 
 # Paths
@@ -403,18 +405,11 @@ def transcribe_file(file_path: str) -> int:
         text = result.get("text", "")
         if text:
             print(f"\n{text}")
-            # Copy to clipboard
             try:
-                subprocess.run(
-                    ["xsel", "--clipboard", "--input"],
-                    input=f"stt-rec: {text}".encode(),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                )
-                print(f"\nCopied {len(text)} chars to clipboard")
-            except Exception:
-                pass
+                method = asyncio.run(copy_text(clipboard_payload(text)))
+                print(f"\nCopied {len(text)} chars to clipboard via {method}")
+            except Exception as e:
+                print(f"\nWARNING: clipboard delivery failed: {e}")
             return 0
         else:
             print("ERROR: Empty transcription result")

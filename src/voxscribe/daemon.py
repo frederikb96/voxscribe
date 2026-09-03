@@ -17,12 +17,13 @@ import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import yaml
 
+from voxscribe.clipboard import clipboard_payload, copy_text
 from voxscribe.paths import OUTPUT_DIR, RECORDINGS_DIR, RESULT_SYMLINK, ensure_output_dir
-from voxscribe.providers import TranscriptionProvider, create_provider
+from voxscribe.providers import TranscriptionProvider, create_provider, strip_overlap
 from voxscribe.silence_gate import SilenceAction, SilenceGate
 
 try:
@@ -134,14 +135,20 @@ if DBUS_AVAILABLE:
         """DBus interface for status updates to GNOME extension.
 
         Signals carry truncated text for efficient panel display.
-        GetStatus returns full text on demand (for popup/copy).
+        GetStatus returns full text on demand (for popup display).
+        CopyToClipboard re-delivers the current text through the daemon's clipboard path.
         """
 
-        def __init__(self, text_provider: "Callable[[], str]") -> None:
+        def __init__(
+            self,
+            text_provider: "Callable[[], str]",
+            copier: "Callable[[], Awaitable[bool]]",
+        ) -> None:
             super().__init__(DBUS_NAME)
             self._state = "idle"
             self._signal_text = ""
             self._text_provider = text_provider
+            self._copier = copier
 
         @dbus_signal()
         def StateChanged(self) -> "ss":
@@ -152,6 +159,11 @@ if DBUS_AVAILABLE:
         def GetStatus(self) -> "ss":
             """Get current state and full transcription text."""
             return [self._state, self._text_provider()]
+
+        @method()
+        async def CopyToClipboard(self) -> "b":
+            """Copy the current transcription to the clipboard again."""
+            return await self._copier()
 
         def emit_state(self, state: str, text: str = "") -> None:
             """Emit state change signal with truncated text for panel display."""
@@ -193,7 +205,9 @@ class VoxscribeDaemon:
 
         try:
             self.dbus_bus = await MessageBus().connect()
-            self.dbus_interface = VoxscribeDBusInterface(self._get_current_text)
+            self.dbus_interface = VoxscribeDBusInterface(
+                self._get_current_text, self._copy_current_text
+            )
             self.dbus_bus.export(DBUS_PATH, self.dbus_interface)
             await self.dbus_bus.request_name(DBUS_NAME)
             logger.info(f"DBus service registered: {DBUS_NAME}")
@@ -252,26 +266,22 @@ class VoxscribeDaemon:
             except Exception as e:
                 logger.debug(f"Sound play failed: {e}")
 
-    def copy_to_clipboard(self, text: str) -> bool:
-        """Copy text to clipboard using xsel (XWayland)."""
-        import subprocess
-
+    async def copy_to_clipboard(self, text: str) -> bool:
+        """Deliver a transcription to the clipboard; False when no method delivered it."""
         try:
-            subprocess.run(
-                ["xsel", "--clipboard", "--input"],
-                input=text.encode(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-            logger.info(f"Copied {len(text)} chars to clipboard")
+            await copy_text(clipboard_payload(text), self.dbus_bus)
             return True
-        except FileNotFoundError:
-            logger.error("xsel not found")
-            return False
         except Exception as e:
-            logger.error(f"Clipboard copy failed: {e}")
+            logger.error(f"Clipboard delivery failed: {e}")
             return False
+
+    async def _copy_current_text(self) -> bool:
+        """Re-deliver the current transcription (extension's Copy button)."""
+        text = self._get_current_text()
+        if not text:
+            logger.info("Copy requested with no transcription available")
+            return False
+        return await self.copy_to_clipboard(text)
 
     def _on_text_update(self, text: str) -> None:
         """Provider callback: transcript text updated."""
@@ -454,13 +464,13 @@ class VoxscribeDaemon:
         result = self._get_current_text()
         logger.info(f"Final transcription: {len(result)} chars")
 
+        copied = True
         if result:
             if self.current_output_file:
                 self.current_output_file.write_text(result)
                 logger.info(f"Saved: {self.current_output_file.name}")
 
-            clipboard_text = f"stt-rec: {result}"
-            self.copy_to_clipboard(clipboard_text)
+            copied = await self.copy_to_clipboard(result)
 
         # Determine outcome
         has_failures = self.provider and self.provider.has_pending()
@@ -468,6 +478,9 @@ class VoxscribeDaemon:
             logger.warning("Partial transcription: pending items remain")
             self.play_sound(SOUND_ERROR)
             self.emit_state("partial")
+        elif not copied:
+            self.play_sound(SOUND_ERROR)
+            self.emit_state("error")
         else:
             self.play_sound(SOUND_DONE)
             self.emit_state("done")
@@ -475,7 +488,7 @@ class VoxscribeDaemon:
         self.state = State.IDLE
         asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
 
-        status = "partial" if has_failures else "complete"
+        status = "partial" if has_failures else ("complete" if copied else "saved, clipboard failed")
         return True, f"Transcription {status}: {len(result)} chars"
 
     def _get_current_text(self) -> str:
@@ -485,7 +498,12 @@ class VoxscribeDaemon:
             provider_text = self.provider.get_text()
             if provider_text:
                 parts.append(provider_text)
-        return " ".join(parts).strip() if parts else ""
+        text = ""
+        for part in parts:
+            part = strip_overlap(text, part)
+            if part:
+                text = f"{text} {part}".strip()
+        return text
 
     def _write_result_file(self) -> None:
         """Write current transcripts to output file (live updates)."""
@@ -534,8 +552,7 @@ class VoxscribeDaemon:
             if self.current_output_file:
                 self.current_output_file.write_text(result)
                 logger.info(f"Saved partial: {self.current_output_file.name}")
-            clipboard_text = f"stt-rec: {result}"
-            self.copy_to_clipboard(clipboard_text)
+            await self.copy_to_clipboard(result)
             logger.info(f"Saved {len(result)} chars before connection loss")
 
         # Notify user of failure

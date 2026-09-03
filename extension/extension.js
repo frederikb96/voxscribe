@@ -13,6 +13,9 @@
  * - error: Red error + "Error!" (auto-hides)
  *
  * Click opens popup with full text and copy button.
+ *
+ * Also owns the clipboard on the daemon's behalf: the daemon calls Copy() over DBus and GNOME
+ * Shell holds the text itself, so no external process or X11 transfer is involved.
  */
 
 import Clutter from "gi://Clutter";
@@ -30,6 +33,19 @@ import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
 const DBUS_NAME = "com.github.frederikb.Voxscribe";
 const DBUS_PATH = "/com/github/frederikb/Voxscribe";
 const DBUS_INTERFACE = "com.github.frederikb.Voxscribe";
+
+// DBus service exported by this extension - must match daemon's clipboard module
+const SHELL_NAME = "com.github.frederikb.Voxscribe.Shell";
+const SHELL_PATH = "/com/github/frederikb/Voxscribe/Shell";
+const SHELL_IFACE_XML = `
+<node>
+  <interface name="${SHELL_NAME}">
+    <method name="Copy">
+      <arg type="s" direction="in" name="text"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+  </interface>
+</node>`;
 
 // Icon names for each state
 const ICONS = {
@@ -50,6 +66,38 @@ const AUTO_HIDE_STATES = {
 
 // All possible state classes for cleanup
 const STATE_CLASSES = ["recording", "transcribing", "done", "partial", "error"];
+
+/**
+ * DBus service letting the daemon hand text to the Shell's own clipboard.
+ */
+class ShellClipboardService {
+  constructor() {
+    this._impl = Gio.DBusExportedObject.wrapJSObject(SHELL_IFACE_XML, this);
+    this._impl.export(Gio.DBus.session, SHELL_PATH);
+    this._nameId = Gio.bus_own_name_on_connection(
+      Gio.DBus.session,
+      SHELL_NAME,
+      Gio.BusNameOwnerFlags.NONE,
+      null,
+      null
+    );
+  }
+
+  Copy(text) {
+    St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+    log(`[Voxscribe] Clipboard set: ${text.length} chars`);
+    return true;
+  }
+
+  destroy() {
+    if (this._nameId) {
+      Gio.bus_unown_name(this._nameId);
+      this._nameId = 0;
+    }
+    this._impl.unexport();
+    this._impl = null;
+  }
+}
 
 const VoxscribeIndicator = GObject.registerClass(
   class VoxscribeIndicator extends PanelMenu.Button {
@@ -182,18 +230,41 @@ const VoxscribeIndicator = GObject.registerClass(
     }
 
     /**
-     * Copy full text to clipboard using native St.Clipboard.
+     * Ask the daemon to re-deliver its current transcription to the clipboard.
+     * The daemon owns the payload format and verifies the copy.
      */
     _copyToClipboard() {
-      if (!this._fullText) {
-        return;
-      }
+      Gio.DBus.session.call(
+        DBUS_NAME,
+        DBUS_PATH,
+        DBUS_INTERFACE,
+        "CopyToClipboard",
+        null,
+        new GLib.VariantType("(b)"),
+        Gio.DBusCallFlags.NONE,
+        15000,
+        null,
+        (connection, result) => {
+          let ok = false;
+          try {
+            [ok] = connection.call_finish(result).deepUnpack();
+          } catch (e) {
+            log(`[Voxscribe] Copy request failed: ${e.message}`);
+          }
+          this._flashLabel(ok ? "Copied!" : "Copy failed!");
+        }
+      );
+    }
 
-      try {
-        const clipboard = St.Clipboard.get_default();
-        clipboard.set_text(St.ClipboardType.CLIPBOARD, this._fullText);
-      } catch (e) {
-        log(`[Voxscribe] Clipboard copy failed: ${e}`);
+    /**
+     * Show a short status in the panel; hides again when idle.
+     */
+    _flashLabel(text) {
+      this._label.set_text(text);
+      this.show();
+      this._clearHideTimeout();
+      if (this._state === "idle") {
+        this._scheduleHide(3, "idle");
       }
     }
 
@@ -394,10 +465,15 @@ export default class VoxscribeExtension extends Extension {
     Main.panel.addToStatusArea(this.uuid, this._indicator);
     this._indicator.connectDbus();
     this._indicator.fetchInitialStatus();
+    this._clipboardService = new ShellClipboardService();
     log("[Voxscribe] Extension enabled");
   }
 
   disable() {
+    if (this._clipboardService) {
+      this._clipboardService.destroy();
+      this._clipboardService = null;
+    }
     if (this._indicator) {
       this._indicator.destroy();
       this._indicator = null;
