@@ -99,14 +99,32 @@ class ShellClipboardService {
   }
 }
 
+/**
+ * Wrapping label whose minimum height is its full wrapped height.
+ *
+ * St.Viewport (the base of St.BoxLayout) allocates its content MAX(minimum, visible) and scrolls
+ * over that range only. A wrapping St.Label reports a one-line minimum, so inside a scroll view
+ * it would be squeezed to the visible height and ellipsized instead of scrolled.
+ */
+const FullHeightLabel = GObject.registerClass(
+  class FullHeightLabel extends St.Label {
+    vfunc_get_preferred_height(forWidth) {
+      const [, natural] = super.vfunc_get_preferred_height(forWidth);
+      return [natural, natural];
+    }
+  }
+);
+
 const VoxscribeIndicator = GObject.registerClass(
   class VoxscribeIndicator extends PanelMenu.Button {
     _init(settings) {
       super._init(0.0, "Voxscribe Indicator", false);
 
       this._settings = settings;
-      this._fullText = "";
       this._state = "idle";
+      // Popup follows the newest text while the reader sits at the end; scrolling up releases it,
+      // returning to the very end re-arms it.
+      this._followEnd = true;
       this._hideTimeoutId = null;
       this._dbusSignalId = null;
 
@@ -187,7 +205,7 @@ const VoxscribeIndicator = GObject.registerClass(
         vscrollbar_policy: St.PolicyType.AUTOMATIC,
       });
 
-      this._textLabel = new St.Label({
+      this._textLabel = new FullHeightLabel({
         text: "No transcription yet",
         style_class: "voxscribe-popup-text",
         x_expand: true,
@@ -196,8 +214,7 @@ const VoxscribeIndicator = GObject.registerClass(
       this._textLabel.clutter_text.set_line_wrap_mode(0); // WORD
       this._textLabel.clutter_text.set_selectable(true);
 
-      // Wrap label in BoxLayout for ScrollView compatibility
-      // BoxLayout constrains width, enabling proper text wrap
+      // BoxLayout is the scrollable viewport and constrains the wrap width
       const textBox = new St.BoxLayout({
         vertical: true,
         x_expand: true,
@@ -207,6 +224,16 @@ const VoxscribeIndicator = GObject.registerClass(
       this._scrollView.set_child(textBox);
       this._textItem.add_child(this._scrollView);
       this.menu.addMenuItem(this._textItem);
+
+      const vadjustment = this._scrollView.vadjustment;
+      vadjustment.connect("notify::value", (adj) => {
+        this._followEnd = adj.value >= adj.upper - adj.page_size - 1;
+      });
+      vadjustment.connect("notify::upper", (adj) => {
+        if (this._followEnd) {
+          adj.value = adj.upper - adj.page_size;
+        }
+      });
 
       // Separator
       this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -221,10 +248,11 @@ const VoxscribeIndicator = GObject.registerClass(
       this._refreshItem.connect("activate", () => this.fetchInitialStatus());
       this.menu.addMenuItem(this._refreshItem);
 
-      // Fetch full text from daemon when popup opens
+      // Opening lands on the newest text
       this.menu.connect("open-state-changed", (_menu, isOpen) => {
         if (isOpen && this._state !== "idle") {
-          this._fetchFullText();
+          this._followEnd = true;
+          this._refreshPopup();
         }
       });
     }
@@ -289,9 +317,9 @@ const VoxscribeIndicator = GObject.registerClass(
     }
 
     /**
-     * Fetch initial state from daemon (in case recording is already active).
+     * Ask the daemon for its state and full text; silent when it is not running.
      */
-    fetchInitialStatus() {
+    _getStatus(onStatus) {
       Gio.DBus.session.call(
         DBUS_NAME,
         DBUS_PATH,
@@ -304,45 +332,34 @@ const VoxscribeIndicator = GObject.registerClass(
         null,
         (connection, result) => {
           try {
-            const reply = connection.call_finish(result);
-            const [state, text] = reply.deepUnpack();
-            log(`[Voxscribe] Initial status: ${state}`);
-            this._updateState(state, text);
+            const [state, text] = connection.call_finish(result).deepUnpack();
+            onStatus(state, text);
           } catch (e) {
-            // Daemon not running - that's fine, stay hidden
-            log(`[Voxscribe] Could not fetch initial status: ${e.message}`);
+            log(`[Voxscribe] Could not fetch status: ${e.message}`);
           }
         }
       );
     }
 
     /**
-     * Fetch full text from daemon for popup display.
+     * Sync indicator with the daemon (recording may already be active).
      */
-    _fetchFullText() {
-      Gio.DBus.session.call(
-        DBUS_NAME,
-        DBUS_PATH,
-        DBUS_INTERFACE,
-        "GetStatus",
-        null,
-        new GLib.VariantType("(ss)"),
-        Gio.DBusCallFlags.NONE,
-        1000,
-        null,
-        (connection, result) => {
-          try {
-            const reply = connection.call_finish(result);
-            const [_state, text] = reply.deepUnpack();
-            if (text && text.length > 0) {
-              this._fullText = text;
-              this._textLabel.set_text(text);
-            }
-          } catch (e) {
-            log(`[Voxscribe] Could not fetch full text: ${e.message}`);
-          }
+    fetchInitialStatus() {
+      this._getStatus((state, text) => {
+        log(`[Voxscribe] Initial status: ${state}`);
+        this._updateState(state, text);
+      });
+    }
+
+    /**
+     * Show the daemon's full text in the popup.
+     */
+    _refreshPopup() {
+      this._getStatus((_state, text) => {
+        if (text.length > 0) {
+          this._textLabel.set_text(text);
         }
-      );
+      });
     }
 
     /**
@@ -400,17 +417,20 @@ const VoxscribeIndicator = GObject.registerClass(
           this._label.set_text(this._truncateStart(text));
         } else {
           // New recording started - clear stale text
-          this._fullText = "";
           this._textLabel.set_text("Recording...");
           this._label.set_text("Recording...");
         }
       } else if (state === "transcribing") {
         this._label.set_text("Processing...");
-        // Keep _fullText and popup text as-is (show last known text)
       } else if (AUTO_HIDE_STATES[state]) {
         const config = AUTO_HIDE_STATES[state];
         this._label.set_text(config.label);
         this._scheduleHide(config.seconds, state);
+      }
+
+      // The signal carries only the panel tail; an open popup wants the whole text
+      if (this.menu.isOpen) {
+        this._refreshPopup();
       }
     }
 
