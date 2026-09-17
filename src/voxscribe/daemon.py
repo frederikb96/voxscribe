@@ -23,7 +23,7 @@ import yaml
 
 from voxscribe.clipboard import clipboard_payload, copy_text
 from voxscribe.paths import OUTPUT_DIR, RECORDINGS_DIR, RESULT_SYMLINK, ensure_output_dir
-from voxscribe.providers import TranscriptionProvider, create_provider, strip_overlap
+from voxscribe.providers import ElevenLabsProvider, strip_overlap
 from voxscribe.silence_gate import SilenceAction, SilenceGate
 
 try:
@@ -89,31 +89,6 @@ def load_config() -> dict[str, Any]:
         with open(CONFIG_FILE) as f:
             config = yaml.safe_load(f)
         logger.info(f"Config loaded from {CONFIG_FILE}")
-
-        # Backward compatibility: migrate old format
-        if "provider" not in config:
-            config["provider"] = "openai"
-        if "openai" not in config and "transcription" in config:
-            old_t = config.pop("transcription")
-            old_v = config.pop("vad", {})
-            oai: dict[str, Any] = {}
-            if "model" in old_t:
-                oai["model"] = old_t["model"]
-            if "prompt" in old_t:
-                oai["prompt"] = old_t["prompt"]
-            if old_t.get("language"):
-                config.setdefault("language", old_t["language"])
-            if "type" in old_v:
-                oai["vad_type"] = old_v["type"]
-            if "threshold" in old_v:
-                oai["vad_threshold"] = old_v["threshold"]
-            if "prefix_padding_ms" in old_v:
-                oai["vad_prefix_padding_ms"] = old_v["prefix_padding_ms"]
-            if "silence_duration_ms" in old_v:
-                oai["vad_silence_duration_ms"] = old_v["silence_duration_ms"]
-            config["openai"] = oai
-            logger.info("Migrated old config format to new provider-based format")
-
         return config
     except Exception as e:
         logger.error(f"Failed to load config: {e}")
@@ -179,7 +154,7 @@ class VoxscribeDaemon:
         self.state = State.IDLE
         self.api_key: str = ""
         self.config = config
-        self.provider: Optional[TranscriptionProvider] = None
+        self.provider: Optional[ElevenLabsProvider] = None
         self.silence_gate: Optional[SilenceGate] = None
         self.pw_record_proc: Optional[asyncio.subprocess.Process] = None
         self.recording_task: Optional[asyncio.Task[None]] = None
@@ -221,15 +196,12 @@ class VoxscribeDaemon:
             self.dbus_interface.emit_state(state, text)
 
     def load_api_key(self) -> bool:
-        """Load API key from environment based on configured provider."""
-        provider_name = self.config.get("provider", "openai")
-        env_var = "OPENAI_API_KEY" if provider_name == "openai" else "ELEVENLABS_API_KEY"
-
-        self.api_key = os.environ.get(env_var, "")
+        """Load the ElevenLabs API key from the environment."""
+        self.api_key = os.environ.get("ELEVENLABS_API_KEY", "")
         if self.api_key:
-            logger.info(f"API key loaded from {env_var}")
+            logger.info("API key loaded from ELEVENLABS_API_KEY")
             return True
-        logger.error(f"{env_var} environment variable not set")
+        logger.error("ELEVENLABS_API_KEY environment variable not set")
         return False
 
     async def _terminate_pw_record(self) -> None:
@@ -329,7 +301,7 @@ class VoxscribeDaemon:
 
         # Create provider
         try:
-            self.provider = create_provider(self.config, self.api_key)
+            self.provider = ElevenLabsProvider(self.api_key, self.config)
             self.provider.on_ready = lambda: logger.info("Provider ready")
             self.provider.on_text_update = self._on_text_update
             self.provider.on_error = self._on_provider_error
@@ -341,12 +313,8 @@ class VoxscribeDaemon:
             asyncio.get_event_loop().call_later(5, lambda: self.emit_state("idle", ""))
             return False, f"Failed to create provider: {e}"
 
-        # Create silence gate (only active for elevenlabs when enabled)
-        provider_name = self.config.get("provider", "openai")
-        if provider_name == "elevenlabs":
-            self.silence_gate = SilenceGate(self.config)
-        else:
-            self.silence_gate = None
+        # Create silence gate (checks its own "enabled" config flag)
+        self.silence_gate = SilenceGate(self.config)
 
         # Start pw-record
         try:
@@ -563,8 +531,6 @@ class VoxscribeDaemon:
 
     async def _reconnect_provider(self, disconnect_pcm_offset: int) -> None:
         """Reconnect to ElevenLabs after resource_exhausted, replay gap audio."""
-        from voxscribe.providers import ElevenLabsProvider
-
         backoff_times = [5, 10, 20]
 
         # Save transcripts from old provider before closing
