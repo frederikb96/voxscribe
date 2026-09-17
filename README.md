@@ -1,6 +1,6 @@
 # Voxscribe
 
-Real-time speech-to-text using OpenAI Realtime or ElevenLabs Scribe v2. Runs as a systemd user daemon with keyboard shortcut control.
+Real-time speech-to-text using ElevenLabs Scribe v2 Realtime. Runs as a systemd user daemon with keyboard shortcut control.
 
 **Features:**
 - Stream transcription to file as you speak
@@ -20,7 +20,7 @@ pipx install git+https://github.com/frederikb/voxscribe.git
 voxscribe setup
 ```
 
-**API key:** Set `OPENAI_API_KEY` environment variable (e.g., in `~/.bashrc`)
+**API key:** Set `ELEVENLABS_API_KEY` environment variable (e.g., in `~/.bashrc`)
 
 ## Usage
 
@@ -69,7 +69,7 @@ pipx uninstall voxscribe
 
 - **PipeWire:** `pw-record` for audio capture, `pw-play` for sound feedback
 - **wl-clipboard:** `wl-paste` for clipboard verification, `wl-copy` as fallback writer
-- **API key:** `OPENAI_API_KEY` or `ELEVENLABS_API_KEY`, matching the configured provider
+- **API key:** `ELEVENLABS_API_KEY`
 
 ## Tests
 
