@@ -51,7 +51,7 @@ ExecStart={python_path} -m voxscribe.daemon
 Restart=always
 RestartSec=3
 Environment="XDG_RUNTIME_DIR=%t"
-PassEnvironment=OPENAI_API_KEY ELEVENLABS_API_KEY
+PassEnvironment=ELEVENLABS_API_KEY
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=voxscribe
@@ -68,23 +68,11 @@ def get_default_config() -> str:
 # Logging level: debug, info, warning, error
 log_level: info
 
-# Transcription provider: openai or elevenlabs
-provider: openai
-
 # Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
 language: ""
 
 # Max seconds to wait for final transcription after stopping recording
 transcription_timeout: 120
-
-# OpenAI Realtime Transcription settings
-openai:
-  model: gpt-4o-transcribe
-  prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way."
-  vad_type: server_vad
-  vad_threshold: 0.5
-  vad_prefix_padding_ms: 300
-  vad_silence_duration_ms: 1500
 
 # ElevenLabs Scribe v2 Realtime settings
 elevenlabs:
@@ -92,7 +80,7 @@ elevenlabs:
   vad_threshold: 0.4
   enable_logging: false
 
-# Client-side silence gate (only used with elevenlabs provider)
+# Client-side silence gate: skip sending near-silent audio to reduce streaming cost
 silence_gate:
   enabled: false
   threshold: 0.010
@@ -147,7 +135,7 @@ def setup() -> int:
 
     # Import environment variables for systemd
     subprocess.run(
-        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"],
+        ["systemctl", "--user", "import-environment", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "ELEVENLABS_API_KEY"],
         capture_output=True,
     )
     print("  Imported Wayland environment")
@@ -327,7 +315,7 @@ def _create_wav(pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, bi
 
 
 def transcribe_file(file_path: str) -> int:
-    """Transcribe a PCM audio file using batch API."""
+    """Transcribe a PCM audio file using the ElevenLabs batch API."""
     import json
     import urllib.error
     import urllib.request
@@ -344,16 +332,14 @@ def transcribe_file(file_path: str) -> int:
     with open(CONFIG_FILE) as f:
         config = yaml.safe_load(f)
 
-    provider = config.get("provider", "openai")
     language = config.get("language", "")
     if language == "auto":
         language = ""
 
     # Get API key
-    env_var = "OPENAI_API_KEY" if provider == "openai" else "ELEVENLABS_API_KEY"
-    api_key = os.environ.get(env_var, "")
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
     if not api_key:
-        print(f"ERROR: {env_var} not set")
+        print("ERROR: ELEVENLABS_API_KEY not set")
         return 1
 
     # Read PCM and wrap in WAV
@@ -369,21 +355,11 @@ def transcribe_file(file_path: str) -> int:
     boundary = "----VoxscribeBatch"
     body = b""
 
-    if provider == "elevenlabs":
-        url = "https://api.elevenlabs.io/v1/speech-to-text"
-        headers: dict[str, str] = {"xi-api-key": api_key}
-        fields = {"model_id": "scribe_v2"}
-        if language:
-            fields["language_code"] = language
-    else:
-        url = "https://api.openai.com/v1/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        fields = {"model": "gpt-4o-transcribe"}
-        if language:
-            fields["language"] = language
-        openai_config = config.get("openai", {})
-        if openai_config.get("prompt"):
-            fields["prompt"] = openai_config["prompt"]
+    url = "https://api.elevenlabs.io/v1/speech-to-text"
+    headers: dict[str, str] = {"xi-api-key": api_key}
+    fields = {"model_id": "scribe_v2"}
+    if language:
+        fields["language_code"] = language
 
     for key, value in fields.items():
         body += f"--{boundary}\r\n".encode()
