@@ -2,23 +2,11 @@
 
 log_level: info
 
-# Transcription provider: openai or elevenlabs
-provider: openai
-
 # Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
 language: en
 
 # Max seconds to wait for final transcription after stopping recording
 transcription_timeout: 120
-
-# OpenAI Realtime Transcription settings
-openai:
-  model: gpt-4o-transcribe
-  prompt: "Transcribe exactly what is said, word for word. Include filler words, repetitions, false starts, and partial sentences. Do not edit, summarize, or clean up the speech in any way."
-  vad_type: server_vad
-  vad_threshold: 0.5
-  vad_prefix_padding_ms: 300
-  vad_silence_duration_ms: 1000
 
 # ElevenLabs Scribe v2 Realtime settings
 elevenlabs:
@@ -26,7 +14,7 @@ elevenlabs:
   vad_threshold: 0.4
   enable_logging: false
 
-# Client-side silence gate (only used with elevenlabs provider)
+# Client-side silence gate: skip sending near-silent audio to reduce streaming cost
 silence_gate:
   enabled: false
   threshold: 0.010
