@@ -22,6 +22,7 @@ import Clutter from "gi://Clutter";
 import GLib from "gi://GLib";
 import Gio from "gi://Gio";
 import GObject from "gi://GObject";
+import Pango from "gi://Pango";
 import St from "gi://St";
 
 import { Extension } from "resource:///org/gnome/shell/extensions/extension.js";
@@ -141,12 +142,15 @@ const VoxscribeIndicator = GObject.registerClass(
       });
       this._box.add_child(this._icon);
 
-      // Label for transcription preview (CSS handles truncation)
+      // Label for transcription preview. Ellipsizes from the START so the panel always shows
+      // the most recent words (the end of the daemon's text) rather than the oldest.
       this._label = new St.Label({
         text: "",
         y_align: Clutter.ActorAlign.CENTER,
         style_class: "voxscribe-label",
       });
+      this._label.clutter_text.set_line_wrap(false);
+      this._label.clutter_text.ellipsize = Pango.EllipsizeMode.START;
       this._box.add_child(this._label);
 
       // Apply width setting
@@ -171,21 +175,6 @@ const VoxscribeIndicator = GObject.registerClass(
     _applyWidthSetting() {
       const maxWidth = this._settings.get_int("label-max-width");
       this._label.set_style(`max-width: ${maxWidth}px;`);
-    }
-
-    /**
-     * Truncate text from START, showing the END (most recent speech).
-     * Returns "...last part of text" format.
-     */
-    _truncateStart(text) {
-      const maxWidth = this._settings.get_int("label-max-width");
-      // Rough estimate: ~7px per char at 11px font
-      const maxChars = Math.floor(maxWidth / 7);
-
-      if (text.length <= maxChars) {
-        return text;
-      }
-      return "..." + text.slice(-(maxChars - 3));
     }
 
     /**
@@ -413,8 +402,8 @@ const VoxscribeIndicator = GObject.registerClass(
       // Handle state-specific behavior
       if (state === "recording") {
         if (text && text.length > 0) {
-          // Show END of text in panel (most recent speech)
-          this._label.set_text(this._truncateStart(text));
+          // Clutter's own ellipsize (set to START above) decides what fits and keeps the tail
+          this._label.set_text(text);
         } else {
           // New recording started - clear stale text
           this._textLabel.set_text("Recording...");

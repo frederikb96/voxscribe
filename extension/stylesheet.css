@@ -1,13 +1,11 @@
 /* Voxscribe GNOME Shell Extension Styles */
 
-/* Panel label - uses CSS truncation instead of JS calculation */
+/* Panel label - width bounded here, ellipsizing done in code (extension.js sets
+   clutter_text.ellipsize = START so the tail, not CSS's own end-ellipsis, stays visible) */
 .voxscribe-label {
   margin-left: 6px;
   font-size: 11px;
   color: #cccccc;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* State-based icon colors (use .state not :state) */
