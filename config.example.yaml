@@ -2,6 +2,10 @@
 
 log_level: info
 
+# Command printing the ElevenLabs API key on stdout, for a key kept in a password store.
+# Leave empty to read ELEVENLABS_API_KEY from the environment instead.
+api_key_command: ""
+
 # Language hint (ISO-639-1 code, e.g., "en", "de") - leave empty for auto-detection
 language: en
 

@@ -20,7 +20,8 @@ pipx install git+https://github.com/frederikb/voxscribe.git
 voxscribe setup
 ```
 
-**API key:** Set `ELEVENLABS_API_KEY` environment variable (e.g., in `~/.bashrc`)
+**API key:** set `ELEVENLABS_API_KEY` in the environment, or point `api_key_command` in the config
+at a command that prints the key (see `config.example.yaml`).
 
 ## Usage
 
@@ -69,7 +70,7 @@ pipx uninstall voxscribe
 
 - **PipeWire:** `pw-record` for audio capture, `pw-play` for sound feedback
 - **wl-clipboard:** `wl-paste` for clipboard verification, `wl-copy` as fallback writer
-- **API key:** `ELEVENLABS_API_KEY`
+- **API key:** `ELEVENLABS_API_KEY` or `api_key_command`
 
 ## Tests
 

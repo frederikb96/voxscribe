@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import yaml
 
+from voxscribe.apikey import ApiKeyError, resolve_api_key
 from voxscribe.clipboard import clipboard_payload, copy_text
 from voxscribe.paths import OUTPUT_DIR, RECORDINGS_DIR, RESULT_SYMLINK, ensure_output_dir
 from voxscribe.providers import ElevenLabsProvider, strip_overlap
@@ -196,13 +197,14 @@ class VoxscribeDaemon:
             self.dbus_interface.emit_state(state, text)
 
     def load_api_key(self) -> bool:
-        """Load the ElevenLabs API key from the environment."""
-        self.api_key = os.environ.get("ELEVENLABS_API_KEY", "")
-        if self.api_key:
-            logger.info("API key loaded from ELEVENLABS_API_KEY")
-            return True
-        logger.error("ELEVENLABS_API_KEY environment variable not set")
-        return False
+        """Resolve the ElevenLabs API key, logging why it is unavailable."""
+        try:
+            self.api_key = resolve_api_key(self.config)
+        except ApiKeyError as e:
+            logger.error(f"No API key: {e}")
+            return False
+        logger.info("API key loaded")
+        return True
 
     async def _terminate_pw_record(self) -> None:
         """Properly terminate pw-record process with wait and kill fallback."""

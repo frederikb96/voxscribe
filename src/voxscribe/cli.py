@@ -24,6 +24,7 @@ from typing import NoReturn
 
 import yaml
 
+from voxscribe.apikey import ApiKeyError, resolve_api_key
 from voxscribe.clipboard import clipboard_payload, copy_text
 from voxscribe.paths import RECORDINGS_DIR
 
@@ -337,9 +338,10 @@ def transcribe_file(file_path: str) -> int:
         language = ""
 
     # Get API key
-    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
-    if not api_key:
-        print("ERROR: ELEVENLABS_API_KEY not set")
+    try:
+        api_key = resolve_api_key(config)
+    except ApiKeyError as e:
+        print(f"ERROR: {e}")
         return 1
 
     # Read PCM and wrap in WAV
